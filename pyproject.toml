@@ -1,0 +1,76 @@
+[project]
+name = "icetl"
+version = "0.0.1"
+description = "Drop-in PySpark-compatible transformation engine over Apache Iceberg, executed by DuckDB"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Arun" }]
+classifiers = ["Private :: Do Not Upload"]
+dependencies = [
+  "pyiceberg[s3fs,pyarrow,sql-sqlite,glue,hive]>=0.11.1,<0.12",
+  "duckdb>=1.5.5,<2",
+  "sqlglot>=30.17.0,<31",
+  "pyarrow>=25.0.1",
+  "pandas>=2.2",
+  "python-dotenv>=1.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+polars = ["polars>=1.0"]
+notebook = ["ipykernel>=6.29", "jupyterlab>=4.2"]
+dev = ["pytest>=8", "pytest-cov", "ruff", "mypy", "hypothesis"]
+
+[project.scripts]
+icetl-smoke = "icetl.diagnostics.smoke:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+# The shadow `pyspark` package ships alongside `icetl` so existing scripts import us
+# unchanged. Splitting it into its own distribution later is a one-line change here.
+packages = ["src/icetl", "src/pyspark"]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# The shadow package exists to re-export; star-imports and unused names are the point.
+"src/pyspark/**" = ["F401", "F403"]
+"src/icetl/**/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "scripts", "tests"]
+disallow_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["duckdb.*", "pandas.*", "pyiceberg.*", "pyarrow.*", "sqlglot.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: requires the live REST catalog + MinIO (deselected by default)",
+]
+# Integration tests are opt-in: `uv run pytest -m integration`.
+addopts = "-m 'not integration' --strict-markers"
+filterwarnings = ["error::DeprecationWarning:icetl.*"]
