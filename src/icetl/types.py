@@ -1,10 +1,10 @@
-"""Spark's type hierarchy, plus `Row`.
+"""The reference engine's type hierarchy, plus `Row`.
 
 Phase 1 carries the types the fixture tables and the thin slice actually produce.
 Phase 3 completes the set (`fromDDL`, `fromJson`, the full mapping matrix) -- the
 classes here are the ones it will extend, not throwaways.
 
-Two of Spark's naming conventions are easy to confuse, so they are spelled out:
+Two of the reference engine's naming conventions are easy to confuse, so they are spelled out:
 
     typeName()      "long", "decimal", "struct"     -- what printSchema shows
     simpleString()  "bigint", "decimal(10,2)"       -- what df.dtypes and DDL show
@@ -49,7 +49,7 @@ __all__ = [
 
 
 class DataType:
-    """Base of every Spark type.
+    """Base of every the reference engine type.
 
     The atomic types are value objects: two `LongType()` compare equal, which is what
     lets schema assertions in tests read naturally.
@@ -73,7 +73,7 @@ class DataType:
         return cls.__name__.removesuffix("Type").lower()
 
     def simpleString(self) -> str:
-        """`bigint`, `array<int>` -- the name `df.dtypes` and Spark DDL use."""
+        """`bigint`, `array<int>` -- the name `df.dtypes` and the reference engine DDL use."""
         return self.typeName()
 
     def treeName(self) -> str:
@@ -84,12 +84,12 @@ class DataType:
         return self.typeName()
 
     def needConversion(self) -> bool:
-        """True when Arrow's Python form of this type is not Spark's."""
+        """True when Arrow's Python form of this type is not the reference engine's."""
         return False
 
     @classmethod
     def fromDDL(cls, ddl: str) -> DataType:
-        """A type from Spark DDL: `"bigint"`, `"decimal(10,2)"`, `"array<string>"`.
+        """A type from the reference engine DDL: `"bigint"`, `"decimal(10,2)"`, `"array<string>"`.
 
         The parser lives in `icetl.parse_types`, imported here rather than at module
         scope so this module stays a plain data model with no dependency on sqlglot.
@@ -123,7 +123,7 @@ class FractionalType(NumericType):
 
 
 class NullType(DataType):
-    """The type of an untyped NULL. Spark spells it `void`."""
+    """The type of an untyped NULL. The reference engine spells it `void`."""
 
     @classmethod
     def typeName(cls) -> str:
@@ -175,11 +175,11 @@ class DateType(AtomicType):
 
 
 class TimestampType(AtomicType):
-    """Spark's `TIMESTAMP`: an instant, stored UTC. Iceberg's `timestamptz`."""
+    """The reference engine's `TIMESTAMP`: an instant, stored UTC. Iceberg's `timestamptz`."""
 
 
 class TimestampNTZType(AtomicType):
-    """Spark's `TIMESTAMP_NTZ`: wall-clock time, no zone. Iceberg's `timestamp`."""
+    """The reference engine's `TIMESTAMP_NTZ`: wall-clock time, no zone. Iceberg's `timestamp`."""
 
     @classmethod
     def typeName(cls) -> str:
@@ -187,7 +187,7 @@ class TimestampNTZType(AtomicType):
 
 
 class DecimalType(FractionalType):
-    """Fixed-precision decimal. Spark's default is `DECIMAL(10, 0)`."""
+    """Fixed-precision decimal. The reference engine's default is `DECIMAL(10, 0)`."""
 
     def __init__(self, precision: int = 10, scale: int = 0) -> None:
         if not 1 <= precision <= 38:
@@ -214,7 +214,7 @@ class DecimalType(FractionalType):
         return f"decimal({self.precision},{self.scale})"
 
     def treeName(self) -> str:
-        # Spark's DecimalType overrides `typeName` to carry precision and scale, so
+        # The reference engine's DecimalType overrides `typeName` to carry precision and scale, so
         # printSchema shows `decimal(10,2)` rather than a bare `decimal`.
         return self.simpleString()
 
@@ -288,7 +288,8 @@ class MapType(DataType):
         }
 
     def needConversion(self) -> bool:
-        # Arrow hands a map back as a list of (key, value) pairs; Spark yields a dict.
+        # Arrow hands a map back as a list of (key, value) pairs; the reference engine yields a
+        # dict.
         return True
 
 
@@ -350,7 +351,7 @@ class StructType(DataType):
         nullable: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> StructType:
-        """Append a field, returning self so calls chain as they do in Spark."""
+        """Append a field, returning self so calls chain as they do in the reference engine."""
         if isinstance(field, StructField):
             self.fields.append(field)
         elif data_type is None:
@@ -387,7 +388,7 @@ class StructType(DataType):
 
     @classmethod
     def fromDDL(cls, ddl: str) -> StructType:
-        """A schema from either Spark DDL spelling.
+        """A schema from either the reference engine DDL spelling.
 
             "id BIGINT, name STRING"          the column-list form
             "struct<id:bigint,name:string>"   the type form
@@ -421,7 +422,7 @@ class StructType(DataType):
         return any(f.needConversion() for f in self.fields)
 
     def treeString(self) -> str:
-        """The `printSchema()` rendering, matching Spark's layout."""
+        """The `printSchema()` rendering, matching the reference engine's layout."""
         lines = ["root"]
         for field in self.fields:
             _tree_field(lines, field.name, field.dataType, field.nullable, " |")
@@ -431,7 +432,7 @@ class StructType(DataType):
 # ---------------------------------------------------------------------------
 # printSchema rendering
 #
-# Spark's shape: every level indents four spaces and re-opens a `|` gutter, and the
+# The reference engine's shape: every level indents four spaces and re-opens a `|` gutter, and the
 # trailing parenthetical names the nullability flag that applies at that level --
 # `nullable` for struct fields, `containsNull` for array elements, `valueContainsNull`
 # for map values. A map *key* carries no flag at all, because keys are never null.
@@ -481,13 +482,13 @@ def _tree_children(lines: list[str], data_type: DataType, prefix: str) -> None:
 class Row(tuple):
     """A result row: a tuple that also answers to its field names.
 
-    Mirrors `pyspark.sql.Row`, including the two-step factory form:
+    Mirrors `icetl.sql.Row`, including the two-step factory form:
 
         >>> Person = Row("name", "age")
         >>> Person("ada", 36)
         Row(name='ada', age=36)
 
-    Field order is insertion order, as in Spark 3.0+ (older Spark sorted kwargs).
+    Field order is insertion order, as in the reference 3.0+ (older releases sorted kwargs).
     """
 
     __fields__: tuple[str, ...] | None

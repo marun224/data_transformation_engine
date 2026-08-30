@@ -1,12 +1,13 @@
-"""Reading Spark types back out of DDL and JSON -- the inverse of `simpleString` and
+"""Reading the reference engine types back out of DDL and JSON -- the inverse of `simpleString` and
 `jsonValue`.
 
-Two entry points, both of which Spark scripts use constantly:
+Two entry points, both of which existing scripts use constantly:
 
     StructType.fromDDL("id BIGINT, name STRING")     schema= on readers, UDF returns
     StructType.fromJson(json.loads(text))            schema round-tripping
 
-**DDL is parsed with sqlglot's Spark dialect, not by hand.** Spark's type grammar has
+**DDL is parsed with sqlglot's the reference engine dialect, not by hand.** the reference engine's
+type grammar has
 more corners than it looks -- `decimal(10,2)`, `array<struct<a:int>>`,
 `map<string,array<int>>`, backtick-quoted field names, `not null` -- and we already
 depend on a parser that knows all of them. Hand-rolling it would mean maintaining a
@@ -14,7 +15,7 @@ second, worse grammar and finding the corners in production.
 
 Living in its own module rather than in `types.py` keeps that dependency one-way:
 `types.py` stays a plain data model with no import of sqlglot, and this is the only
-place that knows how Spark spells a type in text.
+place that knows how the reference engine spells a type in text.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from typing import TYPE_CHECKING, Any
 from sqlglot import exp
 from sqlglot import parse_one as _parse_one
 
-from icetl.errors import PySparkTypeError, PySparkValueError, UnsupportedFeatureError
+from icetl.compat import SQL_DIALECT
+from icetl.errors import EngineTypeError, EngineValueError, UnsupportedFeatureError
 from icetl.types import (
     ArrayType,
     BinaryType,
@@ -52,9 +54,10 @@ if TYPE_CHECKING:
 
 __all__ = ["parse_datatype_json", "parse_datatype_string", "parse_struct_ddl"]
 
-# sqlglot's type token -> the Spark type it means. Several tokens collapse onto one
-# Spark type, which is why this is a mapping rather than a name lookup: Spark has no
-# unsigned types and no `TEXT`, so those widen to what Spark's own reader gives.
+# sqlglot's type token -> the reference engine type it means. Several tokens collapse onto one
+# The reference engine type, which is why this is a mapping rather than a name lookup: the reference
+# engine has no
+# unsigned types and no `TEXT`, so those widen to what the reference engine's own reader gives.
 _TOKENS: dict[Any, DataType] = {
     exp.DataType.Type.BOOLEAN: BooleanType(),
     exp.DataType.Type.TINYINT: ByteType(),
@@ -69,7 +72,8 @@ _TOKENS: dict[Any, DataType] = {
     exp.DataType.Type.BINARY: BinaryType(),
     exp.DataType.Type.VARBINARY: BinaryType(),
     exp.DataType.Type.DATE: DateType(),
-    # Spark's bare `TIMESTAMP` is an *instant*, and sqlglot's Spark dialect resolves
+    # The reference engine's bare `TIMESTAMP` is an *instant*, and sqlglot's the reference engine
+    # dialect resolves
     # it to TIMESTAMPTZ accordingly -- so the TIMESTAMP token below is not what
     # `"timestamp"` parses to here. It is kept as the reading for an already-zoneless
     # token, which is what a DuckDB-parsed node would carry. Pinned by
@@ -82,7 +86,7 @@ _TOKENS: dict[Any, DataType] = {
     exp.DataType.Type.NULL: NullType(),
 }
 
-#: The names Spark's own JSON schema uses for its atomic types.
+#: The names the reference engine's own JSON schema uses for its atomic types.
 _JSON_ATOMIC: dict[str, DataType] = {
     "boolean": BooleanType(),
     "byte": ByteType(),
@@ -106,11 +110,11 @@ _JSON_ATOMIC: dict[str, DataType] = {
 
 
 def _from_sqlglot(node: exp.DataType) -> DataType:
-    """One sqlglot type node as a Spark `DataType`."""
+    """One sqlglot type node as a `DataType`."""
     kind = node.this
 
     if kind == exp.DataType.Type.DECIMAL:
-        # `decimal` with no arguments is Spark's `decimal(10,0)`.
+        # `decimal` with no arguments is the reference engine's `decimal(10,0)`.
         params = [int(p.name) for p in node.expressions if isinstance(p, exp.DataTypeParam)]
         if not params:
             return DecimalType()
@@ -120,12 +124,12 @@ def _from_sqlglot(node: exp.DataType) -> DataType:
 
     if kind in (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST):
         if not node.expressions:
-            raise PySparkValueError("array requires an element type, as in `array<int>`.")
+            raise EngineValueError("array requires an element type, as in `array<int>`.")
         return ArrayType(_from_sqlglot(node.expressions[0]))
 
     if kind == exp.DataType.Type.MAP:
         if len(node.expressions) != 2:
-            raise PySparkValueError("map requires a key and a value type, as in `map<string,int>`.")
+            raise EngineValueError("map requires a key and a value type, as in `map<string,int>`.")
         return MapType(_from_sqlglot(node.expressions[0]), _from_sqlglot(node.expressions[1]))
 
     if kind == exp.DataType.Type.STRUCT:
@@ -135,7 +139,9 @@ def _from_sqlglot(node: exp.DataType) -> DataType:
     if simple is not None:
         return simple
 
-    raise UnsupportedFeatureError(f"The Spark type {node.sql(dialect='spark')!r}", phase="Phase 6")
+    raise UnsupportedFeatureError(
+        f"The reference engine type {node.sql(dialect=SQL_DIALECT)!r}", phase="Phase 6"
+    )
 
 
 def _struct_field(node: exp.Expression) -> StructField:
@@ -143,42 +149,43 @@ def _struct_field(node: exp.Expression) -> StructField:
     if isinstance(node, exp.ColumnDef):
         kind = node.args.get("kind")
         if kind is None:
-            raise PySparkValueError(f"Struct field {node.name!r} has no type.")
+            raise EngineValueError(f"Struct field {node.name!r} has no type.")
         return StructField(node.name, _from_sqlglot(kind), nullable=True)
     if isinstance(node, exp.DataType):
-        # `struct<int, string>` -- Spark names these col1, col2, ...
-        raise PySparkValueError(
+        # `struct<int, string>` -- the reference engine names these col1, col2, ...
+        raise EngineValueError(
             "Struct fields need names, as in `struct<a:int>`; positional struct types "
-            "are not part of Spark's DDL."
+            "are not part of the DDL grammar."
         )
-    raise PySparkValueError(f"Could not read the struct field {node.sql(dialect='spark')!r}.")
+    raise EngineValueError(f"Could not read the struct field {node.sql(dialect=SQL_DIALECT)!r}.")
 
 
-#: Spark type names sqlglot's Spark dialect does not recognise. `void` is Spark's own
+#: The reference engine type names sqlglot's the reference engine dialect does not recognise. `void`
+#: is the reference engine's own
 #: spelling of `NullType` -- it is what `NullType().simpleString()` returns, so
 #: without this entry a schema could be written and not read back.
-_SPARK_ONLY: dict[str, DataType] = {"void": NullType()}
+_EXTRA_TYPE_NAMES: dict[str, DataType] = {"void": NullType()}
 
 
 def parse_datatype_string(ddl: str) -> DataType:
-    """One Spark type from DDL: `"bigint"`, `"decimal(10,2)"`, `"array<string>"`."""
+    """One the reference engine type from DDL: `"bigint"`, `"decimal(10,2)"`, `"array<string>"`."""
     if not isinstance(ddl, str):
-        raise PySparkTypeError(f"Expected a DDL string, got {type(ddl).__name__}.")
+        raise EngineTypeError(f"Expected a DDL string, got {type(ddl).__name__}.")
     text = ddl.strip()
     if not text:
-        raise PySparkValueError("Cannot parse an empty type string.")
-    spark_only = _SPARK_ONLY.get(text.lower())
-    if spark_only is not None:
-        return spark_only
+        raise EngineValueError("Cannot parse an empty type string.")
+    extra_name = _EXTRA_TYPE_NAMES.get(text.lower())
+    if extra_name is not None:
+        return extra_name
     try:
-        built = exp.DataType.build(text, dialect="spark")
+        built = exp.DataType.build(text, dialect=SQL_DIALECT)
     except Exception as exc:
-        raise PySparkValueError(f"{ddl!r} is not a recognised Spark type.") from exc
+        raise EngineValueError(f"{ddl!r} is not a recognised the reference engine type.") from exc
     return _from_sqlglot(built)
 
 
 def parse_struct_ddl(ddl: str) -> StructType:
-    """A `StructType` from Spark's two DDL spellings.
+    """A `StructType` from the reference engine's two DDL spellings.
 
         "id BIGINT, name STRING"        the column-list form, as used by `schema=`
         "struct<id:bigint,name:string>" the type form, as used inside another type
@@ -187,27 +194,27 @@ def parse_struct_ddl(ddl: str) -> StructType:
     which `exp.DataType.build` will not accept. Parsing it as the tail of a
     `CREATE TABLE` is how sqlglot is asked the same question.
 
-    **DDL loses element nullability**, in Spark as much as here:
+    **DDL loses element nullability**, in the reference engine as much as here:
     `ArrayType(StringType(), containsNull=False).simpleString()` is `array<string>`,
     so reading it back gives `containsNull=True`. Round-trip a schema through
     `jsonValue()` / `fromJson()` when that flag matters -- JSON carries it, DDL cannot.
     """
     if not isinstance(ddl, str):
-        raise PySparkTypeError(f"Expected a DDL string, got {type(ddl).__name__}.")
+        raise EngineTypeError(f"Expected a DDL string, got {type(ddl).__name__}.")
     text = ddl.strip()
     if not text:
-        raise PySparkValueError("Cannot parse an empty schema string.")
+        raise EngineValueError("Cannot parse an empty schema string.")
 
     if text.lower().startswith("struct<"):
         parsed = parse_datatype_string(text)
         if not isinstance(parsed, StructType):  # pragma: no cover - defensive
-            raise PySparkValueError(f"{ddl!r} is not a struct type.")
+            raise EngineValueError(f"{ddl!r} is not a struct type.")
         return parsed
 
     # A bare `a INT, b STRING`. `CREATE TABLE _ (...)` gives sqlglot the context it
     # needs, and the column definitions come back in the same shape struct fields do.
     try:
-        statement = _parse_one(f"CREATE TABLE _icetl_ddl ({text})", read="spark")
+        statement = _parse_one(f"CREATE TABLE _icetl_ddl ({text})", read=SQL_DIALECT)
         schema = statement.find(exp.Schema)
         if schema is None:
             raise ValueError("no column list")
@@ -215,14 +222,14 @@ def parse_struct_ddl(ddl: str) -> StructType:
         if not fields:
             raise ValueError("no columns")
     except Exception as exc:
-        raise PySparkValueError(f"Could not parse the schema {ddl!r}: {exc}") from exc
+        raise EngineValueError(f"Could not parse the schema {ddl!r}: {exc}") from exc
     return StructType([_struct_field(field) for field in fields])
 
 
 def parse_datatype_json(value: Any) -> DataType:
-    """A type from Spark's JSON form -- the inverse of `DataType.jsonValue()`.
+    """A type from the reference engine's JSON form -- the inverse of `DataType.jsonValue()`.
 
-    Spark writes an atomic type as a bare string and everything else as an object
+    The reference engine writes an atomic type as a bare string and everything else as an object
     with a `type` discriminator, so this dispatches on which one arrived.
     """
     if isinstance(value, str):
@@ -232,10 +239,10 @@ def parse_datatype_json(value: Any) -> DataType:
             return atomic
         if lowered.startswith("decimal"):
             return parse_datatype_string(lowered)
-        raise PySparkValueError(f"{value!r} is not a recognised Spark type name.")
+        raise EngineValueError(f"{value!r} is not a recognised the reference engine type name.")
 
     if not isinstance(value, dict):
-        raise PySparkTypeError(f"Expected a type name or object, got {type(value).__name__}.")
+        raise EngineTypeError(f"Expected a type name or object, got {type(value).__name__}.")
 
     kind = value.get("type")
     if kind == "array":
@@ -251,12 +258,12 @@ def parse_datatype_json(value: Any) -> DataType:
         )
     if kind == "struct":
         return StructType([_field_from_json(f) for f in value.get("fields", [])])
-    raise PySparkValueError(f"Unknown type object {kind!r}.")
+    raise EngineValueError(f"Unknown type object {kind!r}.")
 
 
 def _field_from_json(value: Mapping[str, Any]) -> StructField:
     if "name" not in value or "type" not in value:
-        raise PySparkValueError(f"A struct field needs `name` and `type`; got {sorted(value)}.")
+        raise EngineValueError(f"A struct field needs `name` and `type`; got {sorted(value)}.")
     return StructField(
         value["name"],
         parse_datatype_json(value["type"]),

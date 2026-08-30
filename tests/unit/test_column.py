@@ -11,7 +11,7 @@ from collections.abc import Callable
 import pytest
 from sqlglot import exp
 
-from icetl.errors import ParseException, PySparkTypeError, PySparkValueError
+from icetl.errors import EngineTypeError, EngineValueError, ParseException
 from icetl.sql import functions as F
 from icetl.sql.column import Column
 from icetl.types import DecimalType, LongType
@@ -51,10 +51,10 @@ class TestConstructors:
         assert F.lit(column) is column
 
     def test_lit_rejects_unsupported_types(self) -> None:
-        with pytest.raises(PySparkTypeError, match="Cannot make a literal"):
+        with pytest.raises(EngineTypeError, match="Cannot make a literal"):
             F.lit(object())
 
-    def test_expr_parses_spark_sql(self) -> None:
+    def test_expr_parses_sql(self) -> None:
         assert sql(F.expr("amount * 2")) == "amount * 2"
 
     def test_expr_rejects_unparseable_text(self) -> None:
@@ -62,9 +62,9 @@ class TestConstructors:
             F.expr("SELECT FROM WHERE ***")
 
     def test_constructors_reject_wrong_types(self) -> None:
-        with pytest.raises(PySparkTypeError):
+        with pytest.raises(EngineTypeError):
             F.col(1)  # type: ignore[arg-type]
-        with pytest.raises(PySparkTypeError):
+        with pytest.raises(EngineTypeError):
             F.expr(1)  # type: ignore[arg-type]
 
 
@@ -102,7 +102,7 @@ class TestOperators:
         assert sql(~(F.col("a") > 1)) == "NOT (a > 1)"
 
     def test_column_cannot_be_used_as_a_bool(self) -> None:
-        with pytest.raises(PySparkValueError, match="Cannot convert a Column into a bool"):
+        with pytest.raises(EngineValueError, match="Cannot convert a Column into a bool"):
             bool(F.col("a") == 1)
 
     def test_operands_are_copied_so_a_column_can_be_reused(self) -> None:
@@ -114,7 +114,7 @@ class TestOperators:
 
 
 class TestDivision:
-    """Spark's `/` yields NULL on a zero divisor; DuckDB 1.5 would yield `inf`."""
+    """The reference engine's `/` yields NULL on a zero divisor; DuckDB 1.5 would yield `inf`."""
 
     def test_division_by_a_column_is_guarded(self) -> None:
         assert sql(F.col("a") / F.col("b")) == "a / NULLIF(b, 0)"
@@ -130,8 +130,8 @@ class TestDivision:
         assert sql(F.col("a") / 0) == "a / NULLIF(0, 0)"
 
     def test_the_sql_surface_produces_the_same_node(self) -> None:
-        # P1: `spark.sql` and the DataFrame API must agree, and they do because
-        # sqlglot's Spark parser sets the same `safe` flag we do.
+        # P1: `Session.sql` and the DataFrame API must agree, and they do because
+        # sqlglot's spark-dialect parser sets the same `safe` flag we do.
         assert sql(F.expr("a / b")) == sql(F.col("a") / F.col("b"))
 
 
@@ -158,7 +158,7 @@ class TestNamingAndCasting:
         assert Column.name is Column.alias
 
     def test_alias_rejects_multiple_names_until_phase_6(self) -> None:
-        with pytest.raises(PySparkValueError, match="exactly one name"):
+        with pytest.raises(EngineValueError, match="exactly one name"):
             F.col("a").alias("x", "y")
 
     @pytest.mark.parametrize(
@@ -173,7 +173,7 @@ class TestNamingAndCasting:
             (lambda: F.lit("x"), "x"),
         ],
     )
-    def test_spark_output_names(self, expression: Callable[[], Column], expected: str) -> None:
+    def test_generated_output_names(self, expression: Callable[[], Column], expected: str) -> None:
         assert expression()._output_name == expected
 
     def test_cast_accepts_a_datatype_or_ddl_string(self) -> None:
@@ -185,12 +185,12 @@ class TestNamingAndCasting:
         assert Column.astype is Column.cast
 
     def test_cast_rejects_nonsense(self) -> None:
-        with pytest.raises(PySparkTypeError):
+        with pytest.raises(EngineTypeError):
             F.col("a").cast(1)  # type: ignore[arg-type]
 
 
 class TestRepr:
-    def test_repr_matches_pyspark_shape(self) -> None:
+    def test_repr_matches_the_reference_shape(self) -> None:
         assert repr(F.col("a")) == "Column<'a'>"
         assert repr(F.col("a") + 1) == "Column<'a + 1'>"
 
@@ -199,5 +199,5 @@ class TestRepr:
         assert repr(quoted) == "Column<'order'>"
 
     def test_column_rejects_non_expressions(self) -> None:
-        with pytest.raises(PySparkTypeError, match="sqlglot expression"):
+        with pytest.raises(EngineTypeError, match="sqlglot expression"):
             Column("a")  # type: ignore[arg-type]

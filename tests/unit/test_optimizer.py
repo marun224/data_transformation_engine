@@ -1,6 +1,6 @@
 """The optimizer pipeline and, above all, the guarantee that makes it safe to run.
 
-`qualify` renames unaliased projections to `_col_0`. For Spark that is a wrong
+`qualify` renames unaliased projections to `_col_0`. For the reference engine that is a wrong
 answer -- the column is called `sum(amount)` and scripts index on it -- so
 `optimize_plan` is contractually required either to restore the names analysis
 computed, or to hand back the original plan untouched. The tests here are mostly
@@ -78,7 +78,7 @@ class TestOutputNames:
         assert result.applied
         assert names(result.optimized) == ["(amount + 1)"]
 
-    def test_an_aggregate_keeps_its_spark_name(self) -> None:
+    def test_an_aggregate_keeps_its_generated_name(self) -> None:
         plan = parse('SELECT "vendor", SUM("amount") FROM "fx"."plain" GROUP BY "vendor"')
         result = optimize_plan(plan, SCHEMA, ["vendor", "sum(amount)"])
 
@@ -147,3 +147,34 @@ class TestUnions:
         )
         result = optimize_plan(plan, SCHEMA, ["(amount + 1)"])
         assert not result.applied
+
+
+class TestArithmeticInsideARule:
+    """`simplify` constant-folds literal arithmetic, and the arithmetic can fail.
+
+    The pipeline's promise is that a rule which cannot handle a plan costs only that
+    rule. An `ArithmeticError` raised *by* a rule broke that promise, because the
+    guard listed only `OptimizeError`, `KeyError`, `ValueError` and `TypeError`.
+    """
+
+    def test_a_literal_division_by_zero_degrades_instead_of_raising(self) -> None:
+        """Python's `decimal` raises `DivisionByZero` when `simplify` folds this."""
+        plan = parse('SELECT 1.0 / 0.0 AS "v" FROM "fx"."plain"')
+        result = optimize_plan(plan, SCHEMA, ["v"])
+        assert "DivisionByZero" in (result.note or "")
+
+    def test_the_rules_before_the_failure_are_kept(self) -> None:
+        """ "Costs only that rule" is literal: the stages that ran before `simplify`
+        are still applied, and the plan they produced is the one that runs."""
+        plan = parse('SELECT 1.0 / 0.0 AS "v" FROM "fx"."plain"')
+        result = optimize_plan(plan, SCHEMA, ["v"])
+        assert result.applied
+        assert "simplify" not in result.stages
+        assert "qualify" in result.stages
+
+    def test_integer_division_by_zero_is_left_alone_by_the_folder(self) -> None:
+        """The spelling that hid the bug: `simplify` refuses to fold integer division
+        at all, so this path never reached the failing arithmetic."""
+        plan = parse('SELECT 1 / 0 AS "v" FROM "fx"."plain"')
+        result = optimize_plan(plan, SCHEMA, ["v"])
+        assert result.applied

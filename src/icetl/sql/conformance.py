@@ -1,13 +1,13 @@
-"""Bending DuckDB to Spark's semantics -- the rules of PLAN.md 3.5.
+"""Bending DuckDB to the reference engine's semantics -- the rules of PLAN.md 3.5.
 
-P5 says Spark is the spec and silent behavioural drift is a bug. DuckDB is a
+P5 says the reference engine is the spec and silent behavioural drift is a bug. DuckDB is a
 different engine with its own defaults, so a query that runs cleanly on both and
 returns *different rows* is the failure mode this module exists to prevent.
 
 **Why this is a rewrite pass and not a pile of special cases in `Column`.** The two
 user surfaces build the same tree (P1), but they build it from different starting
 points: `df.orderBy(col("x"))` constructs an `exp.Ordered` directly, while
-`spark.sql("... ORDER BY x")` gets one from sqlglot's Spark parser. A rule
+`Session.sql("... ORDER BY x")` gets one from sqlglot's spark-dialect parser. A rule
 implemented in `Column` would cover the first and miss the second, and the two
 surfaces would quietly disagree -- exactly what P1 exists to rule out. One pass over
 the finished tree covers both by construction.
@@ -25,11 +25,11 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-__all__ = ["ORDERING_RULE", "apply_spark_semantics"]
+__all__ = ["ORDERING_RULE", "apply_compat_semantics"]
 
-#: What Spark does with NULLs in `ORDER BY`, and what DuckDB 1.5 does unasked.
+#: What the reference engine does with NULLs in `ORDER BY`, and what DuckDB 1.5 does unasked.
 #:
-#: Spark:  ASC -> NULLS FIRST, DESC -> NULLS LAST.
+#: The reference engine:  ASC -> NULLS FIRST, DESC -> NULLS LAST.
 #: DuckDB: NULLS LAST for *both* directions.
 #:
 #: So ASC is a real divergence and DESC happens to agree today. Both are made
@@ -37,7 +37,7 @@ __all__ = ["ORDERING_RULE", "apply_spark_semantics"]
 #: and an explicit clause costs nothing while a silent re-ordering costs a wrong
 #: answer. (PLAN.md 3.5 records DuckDB as nulls-first on DESC; that was true of an
 #: older DuckDB and is not true of 1.5.5 -- see divergence.md.)
-ORDERING_RULE = "Spark: ASC nulls first, DESC nulls last -- always emitted explicitly"
+ORDERING_RULE = "ASC nulls first, DESC nulls last -- always emitted explicitly"
 
 
 def _fix_null_ordering(node: exp.Expression) -> exp.Expression:
@@ -55,22 +55,22 @@ def _fix_null_ordering(node: exp.Expression) -> exp.Expression:
 def _is_explicit_try_cast(node: exp.Cast) -> bool:
     """True when the user wrote `try_cast(...)` rather than `cast(...)`.
 
-    sqlglot's Spark dialect parses *both* spellings into `exp.TryCast`, because
-    Spark's default cast is already lenient -- but it sets `safe=True` only on the
-    explicit one. That flag is the difference between "be lenient because Spark is"
+    sqlglot's the reference engine dialect parses *both* spellings into `exp.TryCast`, because
+    The reference engine's default cast is already lenient -- but it sets `safe=True` only on the
+    explicit one. That flag is the difference between "be lenient because the reference engine is"
     and "be lenient because I asked", and only the first should follow `ansi_mode`.
     """
     return node.args.get("safe") is True
 
 
 def _fix_casts(node: exp.Expression, *, ansi_mode: bool) -> exp.Expression:
-    """Make every cast mean what it would mean in Spark under the current mode.
+    """Make every cast mean what it would mean in the reference engine under the current mode.
 
     The two surfaces arrive here spelled differently, which is the whole reason this
     is a tree pass:
 
-        spark.sql("CAST(x AS INT)")   ->  TryCast(safe=None)   (the Spark dialect
-                                          already knows Spark's default is lenient)
+        Session.sql("CAST(x AS INT)") ->  TryCast(safe=None)   (the spark dialect
+                                          already knows the default is lenient)
         col("x").cast("int")          ->  Cast                 (we build it plainly)
 
     Non-ANSI, both must end up lenient; ANSI, both must end up strict. `TRY_CAST` is
@@ -90,11 +90,13 @@ def _fix_casts(node: exp.Expression, *, ansi_mode: bool) -> exp.Expression:
     return target(this=node.this, to=node.args.get("to"))
 
 
-def apply_spark_semantics(expression: exp.Expression, *, ansi_mode: bool = False) -> exp.Expression:
-    """Rewrite `expression` so DuckDB answers the question Spark would.
+def apply_compat_semantics(
+    expression: exp.Expression, *, ansi_mode: bool = False
+) -> exp.Expression:
+    """Rewrite `expression` so DuckDB answers the question the reference engine would.
 
-    `ansi_mode` mirrors `spark.sql.ansi.enabled`. It is off by default, matching
-    Spark, and turning it on opts into strict casting -- an error where the default
+    `ansi_mode` mirrors `icetl.ansiMode`. It is off by default, matching
+    the reference engine, and turning it on opts into strict casting -- an error where the default
     gives NULL. It does not make everything else strict: integer overflow still
     errors in both modes, because DuckDB cannot be asked to wrap and pretending
     otherwise would be the silent drift P5 forbids. See divergence.md.

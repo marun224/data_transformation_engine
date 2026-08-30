@@ -247,7 +247,7 @@ class TestDescribePredicate:
 class TestTimestampLiterals:
     """A bare date against a timestamp column -- the most ordinary filter there is.
 
-    SQL reads `picked_up >= '2024-01-01'` as midnight that day, and so do Spark and
+    SQL reads `picked_up >= '2024-01-01'` as midnight that day, and so do the reference engine and
     DuckDB. PyIceberg refuses anything short of full ISO-8601, and refuses it by
     *raising* from inside `plan_files()`, so this is both a correctness hazard and
     the difference between pruning a time-partitioned table and scanning all of it.

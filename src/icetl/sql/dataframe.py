@@ -2,7 +2,7 @@
 
 Every transformation returns a new DataFrame wrapping a new sqlglot tree. Nothing
 touches DuckDB until an action is called, with one deliberate exception: the *schema*
-is resolved eagerly, because Spark reports an unknown column at `df.select("typo")`
+is resolved eagerly, because the reference engine reports an unknown column at `df.select("typo")`
 rather than at `df.collect()`, and scripts rely on that.
 
 How a transformation decides whether to extend the current SELECT or nest it:
@@ -25,11 +25,12 @@ from typing import TYPE_CHECKING, Any, cast
 import sqlglot
 from sqlglot import exp
 
+from icetl.compat import SQL_DIALECT
 from icetl.errors import (
     AnalysisException,
+    EngineTypeError,
+    EngineValueError,
     ParseException,
-    PySparkTypeError,
-    PySparkValueError,
     UnsupportedFeatureError,
 )
 from icetl.exec.result import format_show, to_pandas, to_rows
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from icetl.plan.builder import ScanSource
-    from icetl.sql.session import SparkSession
+    from icetl.sql.session import Session
 
 __all__ = ["DataFrame"]
 
@@ -59,7 +60,7 @@ class DataFrame:
 
     def __init__(
         self,
-        session: SparkSession,
+        session: Session,
         plan: exp.Expression,
         sources: dict[str, ScanSource],
     ) -> None:
@@ -124,7 +125,7 @@ class DataFrame:
     # -- column access -----------------------------------------------------
 
     def _resolve_name(self, name: str) -> str | None:
-        """Match `name` against the schema case-insensitively, as Spark does.
+        """Match `name` against the schema case-insensitively, as the reference engine does.
 
         Returns the column's own spelling, or None when there is no match.
         """
@@ -147,7 +148,7 @@ class DataFrame:
         return Column(exp.column(resolved, quoted=True))
 
     def __getitem__(self, item: Any) -> Any:
-        """`df["a"]`, `df[0]`, `df[["a", "b"]]`, and `df[df.a > 1]`, as in PySpark."""
+        """`df["a"]`, `df[0]`, `df[["a", "b"]]`, and `df[df.a > 1]`, as in the reference API."""
         if isinstance(item, str):
             resolved = self._resolve_name(item)
             if resolved is None:
@@ -161,7 +162,7 @@ class DataFrame:
             return self.select(*item)
         if isinstance(item, int):
             return Column(exp.column(self.columns[item], quoted=True))
-        raise PySparkTypeError(f"Cannot index a DataFrame with {type(item).__name__}.")
+        raise EngineTypeError(f"Cannot index a DataFrame with {type(item).__name__}.")
 
     # -- transformations ---------------------------------------------------
 
@@ -169,15 +170,15 @@ class DataFrame:
         """One entry of a `select` list, in projection position.
 
         A bare string names a column here (unlike in operator position, where it is a
-        literal), and an unaliased expression gets Spark's generated name attached so
-        the output column is called what Spark would call it.
+        literal), and an unaliased expression gets the reference engine's generated name attached so
+        the output column is called what the reference engine would call it.
         """
         if isinstance(item, str):
             column = Column(exp.Star()) if item == "*" else self._column_ref(item)
         elif isinstance(item, Column):
             column = item
         else:
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 f"select() takes column names or Column objects, got {type(item).__name__}."
             )
 
@@ -187,9 +188,9 @@ class DataFrame:
         ):
             return expression
         if isinstance(expression, exp.Column) and not expression.table:
-            # An unqualified reference already carries Spark's name for it, so an
+            # An unqualified reference already carries the reference engine's name for it, so an
             # alias would only add `"a" AS "a"` noise to every generated query. A
-            # *qualified* one still needs it: Spark names `t.a` just `a`.
+            # *qualified* one still needs it: the reference engine names `t.a` just `a`.
             return expression
         return as_expression(exp.alias_(expression, column._output_name, quoted=True))
 
@@ -210,20 +211,20 @@ class DataFrame:
         """Project a set of columns or expressions."""
         items = _flatten(cols)
         if not items:
-            raise PySparkValueError("select() needs at least one column.")
+            raise EngineValueError("select() needs at least one column.")
         projection = [self._projection(item) for item in items]
         plan = self._rebase_projection()
         plan.set("expressions", projection)
         return self._derive(plan)
 
     def selectExpr(self, *expr: str) -> DataFrame:
-        """Project from Spark SQL expression strings."""
+        """Project from the reference SQL dialect expression strings."""
         from icetl.sql.functions import expr as parse_expr
 
         return self.select(*[parse_expr(item) for item in _flatten(expr)])
 
     def filter(self, condition: Column | str) -> DataFrame:
-        """Keep rows matching `condition`, given as a Column or a Spark SQL string."""
+        """Keep rows matching `condition`, given as a Column or a SQL string."""
         predicate = _to_predicate(condition)
         if self._is_star_projection() and not self._has_any(_POST_FILTER_CLAUSES):
             plan = cast(exp.Select, self._plan.copy())
@@ -233,15 +234,15 @@ class DataFrame:
         # `.filter()` on the same SELECT means.
         return self._derive(as_expression(plan.where(predicate, copy=False)))
 
-    #: Spark exposes both spellings.
+    #: The reference engine exposes both spellings.
     where = filter
 
     def limit(self, num: int) -> DataFrame:
         """Keep at most `num` rows."""
         if not isinstance(num, int) or isinstance(num, bool):
-            raise PySparkTypeError(f"limit() expects an int, got {type(num).__name__}.")
+            raise EngineTypeError(f"limit() expects an int, got {type(num).__name__}.")
         if num < 0:
-            raise PySparkValueError(f"limit() expects a non-negative count, got {num}.")
+            raise EngineValueError(f"limit() expects a non-negative count, got {num}.")
         if isinstance(self._plan, exp.Select) and not self._has_any(("limit", "offset")):
             plan = self._plan.copy()
         else:
@@ -251,9 +252,9 @@ class DataFrame:
     def withColumn(self, colName: str, col: Column) -> DataFrame:
         """Add a column, or replace one of the same name (case-insensitively)."""
         if not isinstance(colName, str):
-            raise PySparkTypeError(f"withColumn() expects a name, got {type(colName).__name__}.")
+            raise EngineTypeError(f"withColumn() expects a name, got {type(colName).__name__}.")
         if not isinstance(col, Column):
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 f"withColumn() expects a Column, got {type(col).__name__}. "
                 f"Wrap a plain value in F.lit()."
             )
@@ -264,7 +265,7 @@ class DataFrame:
         return self.select(*[replacement if name == existing else name for name in self.columns])
 
     def withColumnRenamed(self, existing: str, new: str) -> DataFrame:
-        """Rename a column. Unknown names are ignored, as in Spark."""
+        """Rename a column. Unknown names are ignored, as in the reference engine."""
         resolved = self._resolve_name(existing)
         if resolved is None:
             return self
@@ -276,20 +277,18 @@ class DataFrame:
         )
 
     def drop(self, *cols: str | Column) -> DataFrame:
-        """Drop columns. Names that do not exist are ignored, as in Spark."""
+        """Drop columns. Names that do not exist are ignored, as in the reference engine."""
         dropped: set[str] = set()
         for item in _flatten(cols):
             if isinstance(item, Column):
                 expression = item._expression
                 if not isinstance(expression, exp.Column):
-                    raise PySparkTypeError(
-                        "drop() only accepts column references, not expressions."
-                    )
+                    raise EngineTypeError("drop() only accepts column references, not expressions.")
                 name = expression.name
             elif isinstance(item, str):
                 name = item
             else:
-                raise PySparkTypeError(
+                raise EngineTypeError(
                     f"drop() expects names or Columns, got {type(item).__name__}."
                 )
             resolved = self._resolve_name(name)
@@ -309,7 +308,7 @@ class DataFrame:
     def alias(self, alias: str) -> DataFrame:
         """Name this DataFrame, so its columns can be qualified as `alias.column`."""
         if not isinstance(alias, str):
-            raise PySparkTypeError(f"alias() expects a string, got {type(alias).__name__}.")
+            raise EngineTypeError(f"alias() expects a string, got {type(alias).__name__}.")
         return self._derive(wrap_as_subquery(self._plan, alias))
 
     # -- actions -----------------------------------------------------------
@@ -361,9 +360,9 @@ class DataFrame:
     def show(
         self, n: int = _DEFAULT_SHOW_ROWS, truncate: bool | int = True, vertical: bool = False
     ) -> None:
-        """Print the first `n` rows, in Spark's layout."""
+        """Print the first `n` rows, in the reference engine's layout."""
         if not isinstance(n, int) or isinstance(n, bool):
-            raise PySparkTypeError(f"show() expects an int row count, got {type(n).__name__}.")
+            raise EngineTypeError(f"show() expects an int row count, got {type(n).__name__}.")
         if truncate is True:
             width = _DEFAULT_TRUNCATE
         elif truncate is False:
@@ -371,7 +370,7 @@ class DataFrame:
         elif isinstance(truncate, int):
             width = truncate
         else:
-            raise PySparkTypeError("show() expects truncate to be a bool or an int.")
+            raise EngineTypeError("show() expects truncate to be a bool or an int.")
 
         # One row past the limit, so the "only showing top n rows" footer is accurate.
         rows = self.take(n + 1)
@@ -476,7 +475,7 @@ def _has_from_clause(plan: exp.Select) -> bool:
 
 
 def _flatten(items: Any) -> list[Any]:
-    """Accept both `select("a", "b")` and `select(["a", "b"])`, as Spark does."""
+    """Accept both `select("a", "b")` and `select(["a", "b"])`, as the reference engine does."""
     if len(items) == 1 and isinstance(items[0], (list, tuple)):
         return list(items[0])
     return list(items)
@@ -487,9 +486,9 @@ def _to_predicate(condition: Column | str) -> exp.Expression:
         return condition._expression.copy()
     if isinstance(condition, str):
         try:
-            return as_expression(sqlglot.parse_one(condition, read="spark"))
+            return as_expression(sqlglot.parse_one(condition, read=SQL_DIALECT))
         except Exception as exc:
             raise ParseException(f"Could not parse the filter {condition!r}: {exc}") from exc
-    raise PySparkTypeError(
+    raise EngineTypeError(
         f"filter() expects a Column or a SQL string, got {type(condition).__name__}."
     )

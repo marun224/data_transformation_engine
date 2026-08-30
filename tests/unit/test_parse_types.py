@@ -1,4 +1,4 @@
-"""Reading Spark types out of DDL and JSON.
+"""Reading the reference engine types out of DDL and JSON.
 
 These are the inverse of `simpleString()` and `jsonValue()`, so most of the value is
 in the round-trips: anything the model can *write* it must be able to read back, or
@@ -12,7 +12,7 @@ from typing import ClassVar
 
 import pytest
 
-from icetl.errors import PySparkTypeError, PySparkValueError, UnsupportedFeatureError
+from icetl.errors import EngineTypeError, EngineValueError, UnsupportedFeatureError
 from icetl.types import (
     ArrayType,
     BinaryType,
@@ -68,7 +68,7 @@ class TestAtomicDDL:
 
 
 class TestTimestampSemantics:
-    """Spark's `TIMESTAMP` is an instant; `TIMESTAMP_NTZ` is wall-clock.
+    """The reference engine's `TIMESTAMP` is an instant; `TIMESTAMP_NTZ` is wall-clock.
 
     Reading these the wrong way round shifts every value by the session's UTC offset
     and nothing raises, which is why they get their own class.
@@ -92,8 +92,8 @@ class TestDecimal:
     def test_precision_and_scale(self) -> None:
         assert DataType.fromDDL("decimal(18,4)") == DecimalType(18, 4)
 
-    def test_bare_decimal_is_spark_default(self) -> None:
-        """Spark's `decimal` with no arguments is `decimal(10,0)`."""
+    def test_bare_decimal_uses_the_reference_default(self) -> None:
+        """The reference engine's `decimal` with no arguments is `decimal(10,0)`."""
         assert DataType.fromDDL("decimal") == DecimalType(10, 0)
 
     def test_precision_only(self) -> None:
@@ -117,7 +117,7 @@ class TestNestedDDL:
         assert parsed.simpleString() == "array<struct<a:int,b:array<map<string,double>>>>"
 
     def test_an_array_without_an_element_type_is_refused(self) -> None:
-        with pytest.raises(PySparkValueError):
+        with pytest.raises(EngineValueError):
             DataType.fromDDL("array")
 
 
@@ -153,16 +153,16 @@ class TestStructDDL:
         parsed = StructType.fromDDL("p STRUCT<x:INT, y:STRUCT<z:DOUBLE>>")
         assert parsed.simpleString() == "struct<p:struct<x:int,y:struct<z:double>>>"
 
-    def test_fields_are_nullable_as_spark_defaults(self) -> None:
+    def test_fields_are_nullable_by_default(self) -> None:
         assert all(f.nullable for f in StructType.fromDDL("a INT, b STRING").fields)
 
     @pytest.mark.parametrize("bad", ["", "   ", "nonsense type here ("])
     def test_unparseable_ddl_is_refused(self, bad: str) -> None:
-        with pytest.raises(PySparkValueError):
+        with pytest.raises(EngineValueError):
             StructType.fromDDL(bad)
 
     def test_a_non_string_is_refused(self) -> None:
-        with pytest.raises(PySparkTypeError):
+        with pytest.raises(EngineTypeError):
             StructType.fromDDL(123)  # type: ignore[arg-type]
 
     def test_an_unsupported_type_names_its_phase(self) -> None:
@@ -206,15 +206,15 @@ class TestJson:
         assert parsed.fields[0].metadata == {"k": "v"}
 
     def test_a_field_missing_its_type_is_refused(self) -> None:
-        with pytest.raises(PySparkValueError):
+        with pytest.raises(EngineValueError):
             StructType.fromJson({"type": "struct", "fields": [{"name": "a"}]})
 
     def test_an_unknown_type_object_is_refused(self) -> None:
-        with pytest.raises(PySparkValueError):
+        with pytest.raises(EngineValueError):
             DataType.fromJson({"type": "matrix"})
 
     def test_a_nonsense_name_is_refused(self) -> None:
-        with pytest.raises(PySparkValueError):
+        with pytest.raises(EngineValueError):
             DataType.fromJson("frobnicate")
 
 
@@ -253,10 +253,10 @@ class TestRoundTrips:
 
 
 class TestDDLLosesElementNullability:
-    """Spark's DDL has nowhere to put `containsNull` / `valueContainsNull`.
+    """The reference engine's DDL has nowhere to put `containsNull` / `valueContainsNull`.
 
     `ArrayType(StringType(), containsNull=False).simpleString()` is `array<string>`,
-    so a DDL round-trip widens it back to nullable. That is Spark's behaviour, not
+    so a DDL round-trip widens it back to nullable. That is the reference engine's behaviour, not
     ours -- but it is a real trap, so it is pinned here rather than left to be
     rediscovered, and `jsonValue()` is the form that keeps the flag.
     """

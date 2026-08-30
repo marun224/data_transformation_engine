@@ -1,8 +1,8 @@
-"""icetl — a drop-in PySpark surface over Apache Iceberg, executed by DuckDB.
+"""icetl — a DataFrame and SQL surface over Apache Iceberg, executed by DuckDB.
 
 See PLAN.md for the architecture. The short version:
 
-    sqlglot    is the single IR         (both `spark.sql()` and DataFrame calls)
+    sqlglot    is the single IR         (both `Session.sql()` and DataFrame calls)
     PyIceberg  plans and commits        (catalog, schema, file pruning, snapshots)
     DuckDB     executes                 (parquet over httpfs, Arrow out)
 """

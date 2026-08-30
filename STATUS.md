@@ -7,25 +7,26 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-08-30, mid Phase 3.
+**Paused:** 2026-08-30, after the Phase 3 work and the decision-15 rename.
 
 ### Where things stand
 
 | | |
 |---|---|
-| Phases 0, 1, 2 | **done**, green |
-| Phase 3 | **in progress** — conformance layer, type parsing and 169 `F.*` names done; the `F.*` tail remains |
+| Phases 0, 1, 2, 3 | **done**, green |
+| Phase 4 | **next** — relational breadth: joins, `groupBy().agg()`, set ops |
 | Phases 12, 13, 14 | **deferred by decision**, each with its own section in PLAN.md §4 |
-| Tests | 711 local, 11 integration |
+| Decision 15 | **done** — the PySpark compat surface is removed; see the section below |
+| Tests | 821 local, 11 integration |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
 
-### Everything is uncommitted
+### Committed
 
-⚠️ **The repository has no commits.** All 85 files are staged in the index and
-nothing has been committed, so the work exists only in the working tree and index.
-That has been true since Phase 0 and is now a lot of work to be holding that way.
+Phases 0 through 2 are committed as `92efdb8` — *"Initial commit: icetl through
+Phase 3 (in progress)"*, 85 files, 16,408 lines.
 
-Nothing here will commit without being asked — say the word and it is one command.
+⚠️ **Phase 3's completion is not committed.** The third `F.*` tranche, the optimizer's
+`ArithmeticError` fix and these notes are in the working tree only.
 
 ### Picking it back up
 
@@ -35,7 +36,8 @@ gitignored; `.env.example` documents every key. Local tests need neither.
 
 ```bash
 uv sync --extra dev            # if the venv is cold
-uv run pytest -q               # 711 expected
+uv run tox                     # the whole gate: lint, mypy, 821 tests, then dist/
+uv run pytest -q               # 821 expected, if you want just the tests
 uv run pytest -m integration -q # 11 expected; needs the catalog up
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 uv run python scripts/smoke_catalog.py -v   # proof of life against the real catalog
@@ -43,16 +45,25 @@ uv run python scripts/smoke_catalog.py -v   # proof of life against the real cat
 
 ### The next thing to do
 
-Finish Phase 3's `F.*` tail — see "Remaining for Phase 3" below. The machinery is in
-place (`_col` for argument coercion, `_fn` for the untyped fallback, typed sqlglot
-nodes preferred), so the remaining work is mechanical **with one hard rule**:
+**Phase 3 is done. Open Phase 4 — relational breadth.** Joins, `groupBy().agg()`, set
+operations, `na.*` and `stat.*`; PLAN.md §4 has the list, and carry-over notes 10 and
+11 are both Phase 4's to pick up.
+
+The `F.*` surface finished at 273 names, each with a value-level test. What is missing
+from it belongs to later phases by design, not by omission:
+
+| What is left | Owner |
+|---|---|
+| JSON, `map_*`, `explode`, higher-order (`transform`, `filter`, `aggregate`, `zip_with`), `arrays_zip`, nested field access | **Phase 6** |
+| `monotonically_increasing_id`, `first_value`/`last_value` as window forms, everything reached through `Column.over` | **Phase 5** |
+| `grouping`, `grouping_id`, `broadcast` | **Phase 4** |
+| Twelve functions with no faithful DuckDB spelling — `crc32`, `soundex`, `typeof`, `try_add` and the rest | each with its reason in `divergence.md` |
+
+The rule that governed all of this still governs the next phase:
 
 > Every function needs a test that asserts on a **value**, not on generated SQL.
 > Around a dozen of the first 169 produced perfectly plausible SQL and the wrong
 > answer. `tests/fixture/test_functions.py` opens with why.
-
-Much of what is left is complex-type and JSON work that Phase 6 owns anyway, so it is
-worth checking PLAN.md §4 before grinding further down the function list.
 
 ---
 
@@ -69,14 +80,14 @@ local `SqlCatalog` test fixture with 5 generated tables.
 
 ## Phase 1 — End-to-end thin slice · **DONE**
 
-`SparkSession` / `spark.table()` / `spark.sql()`, `DataFrame` transformations and
+`Session` / `Session.table()` / `Session.sql()`, `DataFrame` transformations and
 actions, `Column` + `F.col/lit/expr`, eager analysis against zero-row Arrow views,
 minimal scan planner, `explain()`.
 
 **Built:** `types.py` (Spark type hierarchy + `Row`) · `sql/session.py` ·
 `sql/dataframe.py` · `sql/column.py` · `sql/functions.py` · `plan/builder.py` ·
 `plan/analysis.py` · `exec/scan_planner.py` · `exec/result.py` · the shadow
-`src/pyspark` package.
+`src/pyspark` package (removed by decision 15).
 
 ---
 
@@ -241,9 +252,9 @@ there rather than adding it, and defers the harder half to Phase 13.
 
 ---
 
-## Phase 3 — Types, expressions, function library · **IN PROGRESS** (paused 2026-08-30)
+## Phase 3 — Types, expressions, function library · **DONE** (2026-08-30)
 
-Green on: `uv run pytest` (711 passed) · `uv run pytest -m integration` (11 passed) ·
+Green on: `uv run pytest` (822 passed) · `uv run pytest -m integration` (11 passed) ·
 `ruff check` · `ruff format --check` · `mypy`.
 
 ### Decision 8 settled → decision 12
@@ -268,15 +279,15 @@ imported). Recorded as decision 12.
 | Piece | What |
 |---|---|
 | `sql/conformance.py` | The §3.5 rules as one tree pass, run before the optimizer so pushdown sees the tree that executes |
-| `conf.py::SqlSettings` | `spark.sql.ansi.enabled` / `ICETL_ANSI_MODE`, off by default as in Spark |
+| `conf.py::SqlSettings` | `icetl.ansiMode` / `ICETL_ANSI_MODE`, off by default as in the reference |
 | `parse_types.py` | `StructType.fromDDL` (both spellings), `fromJson`, via sqlglot's Spark grammar |
 | `sql/column.py` | Ordering, `like`/`rlike`/`ilike`, `contains`/`startswith`/`endswith`, `substr`, `getItem`/`getField`, bitwise, `eqNullSafe`, `isNaN`, `when`/`otherwise` |
-| `sql/functions.py` | **169 public names** across conditionals, strings, math, trigonometry, date/time, hashing, aggregates, arrays and maps |
+| `sql/functions.py` | **273 public names** across conditionals, strings, math, trigonometry, date/time, hashing, aggregates, arrays and maps |
 | `compat/naming.py` | Spark's generated column names now lower-case the function (`sum(amount)`), keep keywords upper (`CAST(a AS INT)`), and render `count(*)` as `count(1)` |
 
 **Why the conformance rules are a tree pass, not methods on `Column`.** The two
 surfaces build the same tree but from different starting points: `df.orderBy(...)`
-constructs an `exp.Ordered`, while `spark.sql("... ORDER BY x")` gets one from
+constructs an `exp.Ordered`, while `Session.sql("... ORDER BY x")` gets one from
 sqlglot's Spark parser. A rule inside `Column` would cover one and miss the other,
 and the surfaces would quietly disagree — which is what P1 exists to prevent.
 
@@ -302,22 +313,69 @@ Also corrected: PLAN.md §3.5 claims DuckDB sorts nulls *first* on `DESC`. That 
 older release — 1.5.5 is nulls-last in both directions, so `ASC` is the only real
 divergence. Recorded in `divergence.md`.
 
-### Remaining for Phase 3
+### The third `F.*` tranche (2026-08-30) — 105 more names, 274 at the time
 
-- [ ] The rest of the `F.*` surface. **169 public names** are done, each with a
-      value-level test; the remainder is mostly complex-type and JSON work that
-      Phase 6 owns anyway. Every addition needs a value-level test: around a dozen
-      of the first 169 were silently wrong — `split`, `greatest`/`least`,
-      `concat_ws`, `log`, `date_add`/`add_months`/`last_day`/`trunc`, `pmod`,
-      `array_position`, `array_union`, `sequence` — and `F.hash` produced a type
-      Spark cannot represent at all.
+Four batches, each written against DuckDB probes first and then held to Spark's
+documented values:
+
+| Batch | Names | What needed real work rather than a pass-through |
+|---|---|---|
+| Strings | 26 | `overlay` (composed from `substring`), `regexp_substr`/`regexp_instr` (DuckDB's `''`-for-no-match had to be told apart from a genuine empty match), `split_part` (`''` not NULL out of range), `find_in_set` (refuses to match across fields), `octet_length` (`strlen`, not `length`) |
+| Math | 21 | `rint` (HALF_EVEN — `round` is half-away-from-zero and differs on *every* tie), `shiftrightunsigned` (widen to `HUGEINT`, add 2^64, shift, narrow), `width_bucket` (one normalised fraction, so descending bounds work), `csc`/`sec`/`log1p`/`expm1` (absent from DuckDB) |
+| Date/time | 20 | `weekday` (Monday 0 — a *different* shift from `dayofweek`'s Sunday 1), `next_day` (strictly after, so a zero delta means 7), the epoch conversions, `date_part` |
+| Hashing, session, aggregates, arrays | 38 | `array_size` vs `size` (NULL vs -1), `get` vs `element_at` (0- vs 1-indexed, both Spark's), `array_except` (de-duplicates), `equal_null`, `assert_true`, the nine `regr_*` |
+
+**Two functions refuse their argument rather than ignore it.** `rand(seed)` and
+`randn(seed)` raise: DuckDB seeds per *connection*, not per expression, so accepting a
+seed would return unseeded values from the one argument that exists for
+reproducibility. `date_part('DOW', …)` raises for the same class of reason — Spark
+numbers Sunday 1 and DuckDB numbers it 0, and an off-by-one weekday looks perfectly
+fine — and the error names `dayofweek` and `weekday` instead.
+
+**Twelve functions were left unimplemented on purpose**, each with its reason written
+into `divergence.md`: `try_add`/`try_subtract`/`try_multiply` (NULL-on-overflow is not
+reachable — DuckDB raises and has no `TRY(...)`), `crc32`, `soundex`, `typeof`,
+`input_file_name`, the three time-zone functions (need the ICU extension, which is a
+load-time decision rather than a function), `array_insert`, and `shuffle`.
+
+### A Phase 2 defect the tranche uncovered
+
+`SELECT 1.0 / 0.0` **crashed**, on both surfaces, with `decimal.DivisionByZero` raised
+from inside sqlglot's `simplify` rule. Spark answers NULL.
+
+`optimize_plan` caught `OptimizeError`, `KeyError`, `ValueError` and `TypeError` — every
+way a rule was known to fail. But `simplify` constant-folds literal arithmetic, and
+arithmetic has its own exception tree, so the error escaped and Phase 2's "a rule that
+fails costs only that rule" did not hold. The integer spelling `1 / 0` *was* tested on
+both surfaces and could never have found it: `simplify` declines to fold integer
+division at all. `ArithmeticError` is now in the guard; the rules that ran before the
+failure are kept, and the Spark parser's own `NULLIF` still makes the answer NULL.
+
+### Phase 3's checklist, closed
+
+- [x] The rest of the `F.*` surface. **273 public names** (274 until decision 15
+      removed `spark_partition_id`), each with a value-level
+      test. What is left over is Phase 4/5/6 work — see "The next thing to do" at the
+      top for the split. Around a dozen of the first 169 were silently wrong —
+      `split`, `greatest`/`least`, `concat_ws`, `log`,
+      `date_add`/`add_months`/`last_day`/`trunc`, `pmod`, `array_position`,
+      `array_union`, `sequence` — and `F.hash` produced a type Spark cannot represent
+      at all. The third tranche added `rint`, `weekday`, `regexp_substr`,
+      `array_size` and `split_part` to that list of things generated SQL would not
+      have caught.
 - [x] Decimal promotion — **deferred to Phase 14** (decision 14). Measured, with
       Spark's exact formulas, in `divergence.md`. See the deferral note below.
 - [x] Aggregate output column naming. Spark spells a generated name with the function
       in *lower* case (`sum(amount)`) and keeps keywords upper (`CAST(a AS INT)`); we
       were emitting `SUM(amount)`. Fixed via `normalize_functions`, plus `count(*)` →
       `count(1)` as Spark names it. Eight cases in `test_functions2.py`.
-- [ ] `Column.over()` raises for Phase 5; windows are that phase's work.
+- [x] `Column.over()` raises, naming Phase 5. Windows are that phase's work by
+      PLAN.md §4, so raising is the finished state here rather than a gap.
+- [x] Carry-over note 6 (pandas 3.x string dtype) — closed. `exec/result.py`
+      rebuilds string columns from `to_pylist()`, which fixes the dtype *and* the
+      null sentinel at once: pandas 3 would otherwise give `str` dtype holding
+      `nan` where Spark gives `object` holding `None`, and `astype(object)` alone
+      keeps the `nan`. Two cases in `tests/unit/test_result.py`.
 - [x] Conformance-corpus question settled — **decision 13: no PySpark, at any stage.**
       Cases cite Spark's published behaviour. The residual risk is real and named: an
       edge case where Spark differs from its own documentation gives a confidently
@@ -357,6 +415,51 @@ the point.
 
 ---
 
+## Decision 15 — the PySpark compatibility surface is removed (2026-08-30)
+
+Green on: `uv run pytest` (821 passed) · `ruff check` · `ruff format --check` · `mypy`.
+
+icetl is an Iceberg + DuckDB library, and the naming now says so. What changed:
+
+| Was | Now |
+|---|---|
+| `SparkSession` | `Session` |
+| `PySparkException` / `PySparkTypeError` / `ValueError` / `AttributeError` / `NotImplementedError` | `EngineException` / `EngineTypeError` / … |
+| `src/pyspark/**` (9 re-export modules) | deleted, with its `pyproject.toml` entries |
+| `spark.sql.catalog.<name>.*`, `spark.sql.ansi.enabled`, `spark.sql.defaultCatalog` | `icetl.catalog.<name>.*`, `icetl.ansiMode`, `icetl.defaultCatalog` |
+| `F.spark_partition_id` | removed — meaningless in one process; 273 names |
+| `Session.sparkContext`, `Builder.master/enableHiveSupport/remote` | removed — cluster and RDD concepts with nothing to map onto |
+| `apply_spark_semantics`, `arrow_to_spark_type/schema`, `spark_output_name`, `SPARK_VERSION` | `apply_compat_semantics`, `arrow_to_datatype`/`arrow_to_struct_type`, `output_name`, `REFERENCE_SEMANTICS_VERSION` |
+| `Session.version` → `"3.5.0"` | → icetl's version; `Session.reference_semantics` gives `3.5.0` |
+
+**Spark did not stop being the specification.** P5 still holds; it is now written as
+*the reference*, defined once at the top of `compat/divergence.md`. Nothing runs on,
+links against, or requires Spark.
+
+**Two things survive on purpose**, and are commented so they do not read as misses:
+
+1. **sqlglot's `"spark"` dialect** — now the named constant `SQL_DIALECT` in
+   `icetl/compat/__init__.py`, used at all 12 sites. It is an argument value in
+   sqlglot's API naming a SQL *grammar*; changing it would change the language accepted.
+2. **The `F.*` vocabulary** — `date_format`, `weekday`, `array_except` and the rest are
+   the data vocabulary the library exists to provide. Only `spark_partition_id` was
+   brand-named, and it is gone.
+
+**Two hazards found while doing it**, both worth remembering:
+
+- **Rewriting `.py` files with PowerShell corrupted them.** `Get-Content`/`Set-Content
+  -Encoding utf8` on PS 5.1 reads as ANSI and writes UTF-8 *with BOM*, double-encoding
+  every non-ASCII character — `héllo` became `héllo` and three string-length tests
+  failed. Bulk edits go through Python with explicit `encoding="utf-8"`.
+- **A blind prose substitution corrupted test data.** `F.lit("Spark SQL")` is an input,
+  not prose. The repair distinguishes docstrings from other string literals with `ast`;
+  the payloads are now neutral (`"Basic SQL"`), base64 cases included.
+
+**Not covered by any test:** the shadow package had no test importing it, so its
+deletion regressed nothing — and nothing ever proved the zero-edit promise worked.
+
+---
+
 ## Carry-over notes
 
 Things found during earlier phases that later phases need.
@@ -364,7 +467,7 @@ Things found during earlier phases that later phases need.
 | # | Note | Affects |
 |---|---|---|
 | 1 | Windows: PyIceberg needs `file://C:/x`, DuckDB rejects it. Handled by `icetl.paths`; don't bypass it. | any new file-reading code |
-| 6 | `pandas>=2.2` resolves to pandas 3.x, whose default string dtype differs from Spark's `toPandas()` `object` dtype. Still undecided. | Phase 3 |
+| ~~6~~ | ~~`pandas>=2.2` resolves to pandas 3.x, whose default string dtype differs from Spark's `toPandas()` `object` dtype~~ — **closed in Phase 3**: `exec/result.py` rebuilds string columns from `to_pylist()`, correcting the dtype and the null sentinel together. | — |
 | 12 | sqlglot wraps some typed nodes (`Greatest`, `Least`, `ConcatWs`) in a NULL-propagating `CASE` for DuckDB, and renders `Log`'s operands reversed. Prefer a plain call and a value-level test over assuming a typed node is conformant. | Phase 3 onward |
 | ~~9~~ | ~~Golden conformance files generated from real PySpark~~ — **closed by decision 13**: no PySpark at any stage. Cases are written from Spark's published behaviour with a citation each. | — |
 | 10 | The optimizer declines to rewrite a `UNION` whose output names need restoring, so set operations get no pushdown. Fixable by re-aliasing the first branch. | Phase 4 |
@@ -385,4 +488,4 @@ ICETL_DEFAULT_NAMESPACE=nyc
 - [x] `scripts/smoke_catalog.py -v` — passes.
 - [x] `uv run pytest -m integration` — 11 passed, including `test_phase2_rest.py`.
 - [x] `httpfs`, the S3 secret, and `engine_paths` on `s3://` URLs all exercised.
-- [ ] The repo has no commits yet — see "Everything is uncommitted" at the top.
+- [x] Committed as `92efdb8` — see "Committed" at the top.

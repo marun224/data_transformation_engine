@@ -1,4 +1,4 @@
-"""The optimizer pipeline: the same rules for `spark.sql()` and the DataFrame API.
+"""The optimizer pipeline: the same rules for `Session.sql()` and the DataFrame API.
 
 The DataFrame builder nests a subquery for every operation it cannot safely merge,
 so a five-call chain arrives here as five levels of `SELECT * FROM (...)`. That shape
@@ -13,7 +13,7 @@ exotic plan should cost us only that rule. Each stage is individually
 semantics-preserving, so keeping the last stage that succeeded is always sound.
 
 **The output-name guarantee.** `qualify` renames unaliased projections to `_col_0`,
-which for us would be a wrong answer -- Spark calls that column `sum(amount)` and
+which for us would be a wrong answer -- the reference engine calls that column `sum(amount)` and
 scripts index on the name. So the optimized tree is adopted only if its output
 columns can be made to match the names analysis already computed, and the top-level
 projections are re-aliased to those names before it is used. Anything that cannot be
@@ -150,9 +150,18 @@ def optimize_plan(
     for name in RULES:
         try:
             current = _apply(name, current, schema)
-        except (OptimizeError, KeyError, ValueError, TypeError) as exc:
+        except (OptimizeError, KeyError, ValueError, TypeError, ArithmeticError) as exc:
             # A rule that cannot handle this plan is not an error the user caused.
             # Keep what the earlier rules achieved and stop.
+            #
+            # `ArithmeticError` is here because `simplify` constant-folds literal
+            # arithmetic, and the arithmetic can fail: `SELECT 1.0 / 0.0` reaches
+            # Python's decimal division and raises `decimal.DivisionByZero`. The reference engine
+            # answers NULL, and does so here too once the rule is skipped, because
+            # the reference engine parser's own `NULLIF` guard is still in the tree. The integer
+            # spelling `1 / 0` never showed this: `simplify` declines to fold integer
+            # division at all, which is why the rule was reachable only with a decimal
+            # literal. Overflow and `decimal.InvalidOperation` arrive the same way.
             note = f"stopped at {name}: {type(exc).__name__}: {exc}"
             break
         stages.append(name)

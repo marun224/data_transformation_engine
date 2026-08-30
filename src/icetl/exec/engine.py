@@ -176,7 +176,7 @@ class DuckDBEngine:
     def execute(
         self, sql: str, parameters: dict[str, Any] | list[Any] | None = None
     ) -> duckdb.DuckDBPyConnection:
-        """Run `sql`, translating DuckDB errors into the PySpark hierarchy."""
+        """Run `sql`, translating DuckDB errors into the engine error hierarchy."""
         cursor = self.cursor()
         try:
             return (

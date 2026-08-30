@@ -1,13 +1,13 @@
-"""Exception hierarchy mirroring `pyspark.errors`.
+"""The exception hierarchy.
 
-Drop-in compatibility includes *failure* modes: a script with
-`except AnalysisException:` around a missing-table lookup must keep working. So the
-public names, their inheritance, and the `getMessage()`/`getErrorClass()` accessors
-follow PySpark rather than inventing our own scheme.
+Failure modes are part of the API: a script with `except AnalysisException:` around a
+missing-table lookup must keep working across releases. So the public names, their
+inheritance, and the `getMessage()`/`getErrorClass()` accessors are stable surface,
+not incidental.
 
-icetl-specific errors subclass the PySpark exception a user would expect to catch:
-`TableNotFoundError` is an `AnalysisException`, `UnsupportedFeatureError` is a
-`PySparkNotImplementedError`, and so on.
+Errors specific to icetl subclass the general error a user would expect to catch:
+`TableNotFoundError` is an `AnalysisException`, `UnsupportedFeatureError` is an
+`EngineNotImplementedError`, and so on.
 """
 
 from __future__ import annotations
@@ -16,15 +16,15 @@ __all__ = [
     "AnalysisException",
     "CatalogNotFoundError",
     "ConfigurationError",
+    "EngineAttributeError",
+    "EngineException",
+    "EngineNotImplementedError",
+    "EngineTypeError",
+    "EngineValueError",
     "IcetlError",
     "IllegalArgumentException",
     "NamespaceNotFoundError",
     "ParseException",
-    "PySparkAttributeError",
-    "PySparkException",
-    "PySparkNotImplementedError",
-    "PySparkTypeError",
-    "PySparkValueError",
     "PythonException",
     "QueryExecutionException",
     "TableAlreadyExistsException",
@@ -36,14 +36,13 @@ __all__ = [
 
 
 class IcetlError(Exception):
-    """Root of every error icetl raises. Not part of the PySpark surface."""
+    """Root of every error icetl raises, including setup errors."""
 
 
-class PySparkException(IcetlError):
-    """Base class for the PySpark-compatible exceptions.
+class EngineException(IcetlError):
+    """Base class for errors raised while building or running a query.
 
-    Mirrors `pyspark.errors.PySparkException`, including the error-class accessors
-    added in Spark 3.4 that user code sometimes branches on.
+    Carries the error-class accessors that user code sometimes branches on.
     """
 
     def __init__(
@@ -73,11 +72,12 @@ class PySparkException(IcetlError):
         return None
 
 
-class AnalysisException(PySparkException):
+class AnalysisException(EngineException):
     """Raised when a plan cannot be analysed: unknown table, column, or bad types.
 
-    Raised at *transformation* time, not action time, matching Spark: an unresolvable
-    reference must fail at `df.select("typo")`, not later at `df.collect()`.
+    Raised at *transformation* time, not action time, as the reference semantics
+    require: an unresolvable reference must fail at `df.select("typo")`, not later at
+    `df.collect()`.
     """
 
 
@@ -85,19 +85,19 @@ class ParseException(AnalysisException):
     """Raised when SQL text cannot be parsed."""
 
 
-class IllegalArgumentException(PySparkException):
-    """Raised when an argument is invalid, matching Spark's Java-derived name."""
+class IllegalArgumentException(EngineException):
+    """Raised when an argument is invalid."""
 
 
-class UnsupportedOperationException(PySparkException):
-    """Raised when an operation is valid Spark but not supported here."""
+class UnsupportedOperationException(EngineException):
+    """Raised when an operation is well-formed but not supported here."""
 
 
-class QueryExecutionException(PySparkException):
+class QueryExecutionException(EngineException):
     """Raised when a query fails during execution rather than analysis."""
 
 
-class PythonException(PySparkException):
+class PythonException(EngineException):
     """Raised when user Python code (a UDF) fails."""
 
 
@@ -109,32 +109,32 @@ class TableAlreadyExistsException(AnalysisException):
     """Raised when creating a table that already exists."""
 
 
-class PySparkValueError(PySparkException, ValueError):
-    """A ValueError that is also catchable as a PySparkException."""
+class EngineValueError(EngineException, ValueError):
+    """A ValueError that is also catchable as an EngineException."""
 
 
-class PySparkTypeError(PySparkException, TypeError):
-    """A TypeError that is also catchable as a PySparkException."""
+class EngineTypeError(EngineException, TypeError):
+    """A TypeError that is also catchable as an EngineException."""
 
 
-class PySparkAttributeError(PySparkException, AttributeError):
-    """An AttributeError that is also catchable as a PySparkException."""
+class EngineAttributeError(EngineException, AttributeError):
+    """An AttributeError that is also catchable as an EngineException."""
 
 
-class PySparkNotImplementedError(PySparkException, NotImplementedError):
-    """A NotImplementedError that is also catchable as a PySparkException."""
+class EngineNotImplementedError(EngineException, NotImplementedError):
+    """A NotImplementedError that is also catchable as an EngineException."""
 
 
 # ---------------------------------------------------------------------------
-# icetl-specific errors, each subclassing the PySpark error a user would catch
+# icetl-specific errors, each subclassing the error a user would catch
 # ---------------------------------------------------------------------------
 
 
 class ConfigurationError(IcetlError):
     """Raised when configuration is missing or contradictory.
 
-    Deliberately *not* a PySparkException: it means icetl is set up wrong, which is
-    not a condition any Spark script would have a handler for.
+    Deliberately *not* an EngineException: it means icetl is set up wrong, which is a
+    startup fault rather than something a query handler would catch.
     """
 
 
@@ -150,8 +150,8 @@ class TableNotFoundError(AnalysisException):
     """Raised when a table does not exist in the catalog."""
 
 
-class UnsupportedFeatureError(PySparkNotImplementedError):
-    """Raised for a real Spark feature icetl has not implemented yet.
+class UnsupportedFeatureError(EngineNotImplementedError):
+    """Raised for a feature icetl has not implemented yet.
 
     Carries the phase from PLAN.md that will deliver it, so the error tells the
     reader *when* rather than just *no*.

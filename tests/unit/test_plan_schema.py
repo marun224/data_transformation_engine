@@ -44,7 +44,7 @@ class TestPrimitiveTypes:
         assert iceberg_to_duckdb_type(iceberg_type) == expected
 
     def test_the_timestamp_zone_distinction_survives(self) -> None:
-        """Iceberg's timestamp/timestamptz split is Spark's TIMESTAMP_NTZ/TIMESTAMP one.
+        """Iceberg's timestamp/timestamptz split is the reference TIMESTAMP_NTZ/TIMESTAMP one.
 
         Flattening the two here would lose it for every rule downstream, and the loss
         would only show up as a silently wrong hour.

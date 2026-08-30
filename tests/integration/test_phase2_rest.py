@@ -26,7 +26,7 @@ from pyiceberg.expressions import And
 
 from icetl.catalog import CatalogRegistry, TableResolver
 from icetl.conf import IcetlSettings, resolve_settings
-from icetl.sql import SparkSession
+from icetl.sql import Session
 from tests.predicates import GreaterThanOrEqual, LessThan
 
 if TYPE_CHECKING:
@@ -52,8 +52,8 @@ def settings() -> IcetlSettings:
 
 
 @pytest.fixture(scope="module")
-def spark(settings: IcetlSettings) -> SparkSession:
-    return SparkSession(settings=settings)
+def session(settings: IcetlSettings) -> Session:
+    return Session(settings=settings)
 
 
 def scan_of(df: DataFrame) -> ScanPlan:
@@ -63,21 +63,21 @@ def scan_of(df: DataFrame) -> ScanPlan:
 
 
 class TestProjectionPushdown:
-    def test_a_two_column_query_does_not_read_all_of_them(self, spark: SparkSession) -> None:
-        df = spark.table(f"{NAMESPACE}.{WIDE_TABLE}").select("VendorID", "trip_distance")
+    def test_a_two_column_query_does_not_read_all_of_them(self, session: Session) -> None:
+        df = session.table(f"{NAMESPACE}.{WIDE_TABLE}").select("VendorID", "trip_distance")
         scan = scan_of(df)
         assert scan.columns == ("VendorID", "trip_distance")
         assert scan.total_columns > 100, "expected the wide fixture table"
 
-    def test_mixed_case_column_names_survive_the_optimizer(self, spark: SparkSession) -> None:
+    def test_mixed_case_column_names_survive_the_optimizer(self, session: Session) -> None:
         """The optimizer runs in DuckDB's dialect, which lowercases identifiers.
         Output names are restored from the analysed schema, so `VendorID` keeps its
         spelling -- scripts index on it."""
-        df = spark.table(f"{NAMESPACE}.{WIDE_TABLE}").select("VendorID", "trip_distance")
+        df = session.table(f"{NAMESPACE}.{WIDE_TABLE}").select("VendorID", "trip_distance")
         assert df.columns == ["VendorID", "trip_distance"]
 
-    def test_an_aggregate_with_order_by_still_prunes_columns(self, spark: SparkSession) -> None:
-        df = spark.sql(
+    def test_an_aggregate_with_order_by_still_prunes_columns(self, session: Session) -> None:
+        df = session.sql(
             f"SELECT VendorID, sum(total_amount) AS revenue "
             f"FROM {NAMESPACE}.{TABLE} "
             f"WHERE {TIME_COLUMN} >= '{MONTH_START}' "
@@ -89,10 +89,10 @@ class TestProjectionPushdown:
 
 
 class TestPartitionPruning:
-    def test_a_bare_date_against_a_timestamp_column_prunes(self, spark: SparkSession) -> None:
+    def test_a_bare_date_against_a_timestamp_column_prunes(self, session: Session) -> None:
         """The filter anyone would actually write. PyIceberg rejects a bare date, so
         it is widened to full ISO-8601 before being pushed."""
-        df = spark.sql(
+        df = session.sql(
             f"SELECT count(*) AS n FROM {NAMESPACE}.{TABLE} "
             f"WHERE {TIME_COLUMN} >= '{MONTH_START}' AND {TIME_COLUMN} < '{MONTH_END}'"
         )
@@ -101,10 +101,10 @@ class TestPartitionPruning:
         assert scan.files_total is not None
         assert scan.files_scanned < scan.files_total, "nothing was pruned"
 
-    def test_the_filter_is_still_in_the_generated_sql(self, spark: SparkSession) -> None:
+    def test_the_filter_is_still_in_the_generated_sql(self, session: Session) -> None:
         """Iceberg pruning is stats-based and approximate; DuckDB re-applying the
         predicate is what makes the row count exact."""
-        df = spark.sql(
+        df = session.sql(
             f"SELECT count(*) AS n FROM {NAMESPACE}.{TABLE} WHERE {TIME_COLUMN} >= '{MONTH_START}'"
         )
         sql = df._session._compile(df._plan, df._sources, df.columns).sql
@@ -113,13 +113,13 @@ class TestPartitionPruning:
 
 class TestPrunedResultsMatchPyIceberg:
     def test_a_pruned_count_equals_pyicebergs_own(
-        self, spark: SparkSession, settings: IcetlSettings
+        self, session: Session, settings: IcetlSettings
     ) -> None:
         """The differential test that matters: pruning must change speed, not answers.
 
         PyIceberg is the authority -- it is the thing that owns the metadata -- so the
         two engines counting the same rows is the strongest correctness signal
-        available without a second Spark.
+        available without a second the reference engine.
         """
         resolver = TableResolver(
             CatalogRegistry(settings), default_namespace=tuple(NAMESPACE.split("."))
@@ -137,7 +137,7 @@ class TestPrunedResultsMatchPyIceberg:
             .num_rows
         )
 
-        df = spark.sql(
+        df = session.sql(
             f"SELECT count(*) AS n FROM {NAMESPACE}.{TABLE} "
             f"WHERE {TIME_COLUMN} >= '{MONTH_START}' AND {TIME_COLUMN} < '{MONTH_END}'"
         )
@@ -146,12 +146,12 @@ class TestPrunedResultsMatchPyIceberg:
 
 class TestHivePartitioning:
     def test_the_partition_column_is_read_from_the_data_not_the_path(
-        self, spark: SparkSession
+        self, session: Session
     ) -> None:
         """The warehouse lays data out as `.../pickup_month=2024-12/...`, which DuckDB
         auto-detects as Hive partitioning and would synthesise a *typed* column from.
         The value has to come from the file."""
-        df = spark.table(f"{NAMESPACE}.{TABLE}").select(TIME_COLUMN).limit(1)
+        df = session.table(f"{NAMESPACE}.{TABLE}").select(TIME_COLUMN).limit(1)
         value = df.collect()[0][0]
         assert isinstance(value, datetime.datetime), (
             f"{TIME_COLUMN} came back as {type(value).__name__}, "

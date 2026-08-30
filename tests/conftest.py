@@ -18,7 +18,7 @@ from icetl.catalog import CatalogRegistry, TableResolver
 from icetl.conf import CatalogSettings, EngineSettings, IcetlSettings, SqlSettings
 from icetl.exec import DuckDBEngine
 from icetl.plan.builder import ScanSource
-from icetl.sql import SparkSession
+from icetl.sql import Session
 from tests.fixtures import FixtureTable, build_all, local_catalog, warehouse_uri
 
 if TYPE_CHECKING:
@@ -95,33 +95,33 @@ def engine(local_settings: IcetlSettings, tmp_path: Path) -> Iterator[DuckDBEngi
 
 
 @pytest.fixture
-def spark(
+def session(
     local_settings: IcetlSettings, catalog: SqlCatalog, tmp_path: Path
-) -> Iterator[SparkSession]:
-    """A SparkSession wired to the local fixture catalog.
+) -> Iterator[Session]:
+    """A Session wired to the local fixture catalog.
 
-    Built directly rather than through `SparkSession.builder`, so tests never touch
+    Built directly rather than through `Session.builder`, so tests never touch
     the process-wide active session and can run in any order.
     """
     settings = replace(
         local_settings, engine=EngineSettings(temp_directory=str(tmp_path / "spill"))
     )
-    session = SparkSession(settings=settings, catalog=catalog)
+    session = Session(settings=settings, catalog=catalog)
     yield session
     session.stop()
 
 
 @pytest.fixture
-def ansi_spark(
+def ansi_session(
     local_settings: IcetlSettings, catalog: SqlCatalog, tmp_path: Path
-) -> Iterator[SparkSession]:
-    """A session with `spark.sql.ansi.enabled=true`, for the strict-cast cases."""
+) -> Iterator[Session]:
+    """A session with `icetl.ansiMode=true`, for the strict-cast cases."""
     settings = replace(
         local_settings,
         engine=EngineSettings(temp_directory=str(tmp_path / "spill")),
         sql=SqlSettings(ansi_mode=True),
     )
-    session = SparkSession(settings=settings, catalog=catalog)
+    session = Session(settings=settings, catalog=catalog)
     yield session
     session.stop()
 

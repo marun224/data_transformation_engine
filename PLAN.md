@@ -8,19 +8,17 @@
 
 ## 1. What we are building
 
-A **pip-installable, single-node ETL / transformation library** that gives you a
-**drop-in PySpark-compatible API** over **Apache Iceberg** tables, executed by **DuckDB**.
-
-**Zero-edit drop-in:** the distribution ships a top-level `pyspark` package that
-shadows the real one, so existing scripts run **unchanged** — not even the import line.
+A **pip-installable, single-node ETL / transformation library** over **Apache
+Iceberg** tables, executed by **DuckDB**, with a lazy **DataFrame API** and a **SQL
+surface** that are one code path rather than two.
 
 ```python
-from pyspark.sql import SparkSession, functions as F  # ← this is us
+from icetl.sql import Session, functions as F
 
-spark = SparkSession.builder.appName("etl").getOrCreate()
+session = Session.builder.appName("etl").getOrCreate()
 
 df = (
-    spark.table("nyc.yellow_tripdata")
+    session.table("nyc.yellow_tripdata")
     .filter(F.col("tpep_pickup_datetime") >= "2023-01-01")
     .groupBy("VendorID")
     .agg(F.sum("total_amount").alias("revenue"))
@@ -29,11 +27,17 @@ df = (
 df.write.mode("overwrite").saveAsTable("nyc.revenue_by_vendor")
 ```
 
+**Semantics come from a written specification.** Where DuckDB's behaviour is a
+defensible choice rather than the only one, icetl follows **Apache Spark 3.5** — called
+*the reference* throughout, and exposed as `REFERENCE_SEMANTICS_VERSION`. That is a spec
+reference, not a dependency: nothing here runs on, links against, or requires Spark, and
+the public API is icetl's own. See decision 15.
+
 ### The three pillars
 
 | Library | Role | Never used for |
 |---|---|---|
-| **sqlglot** | The **single intermediate representation**. Both the DataFrame API and `spark.sql()` produce the *same* sqlglot AST. Optimizes it, then generates DuckDB SQL. | Execution |
+| **sqlglot** | The **single intermediate representation**. Both the DataFrame API and `Session.sql()` produce the *same* sqlglot AST. Optimizes it, then generates DuckDB SQL. | Execution |
 | **DuckDB** | The **execution engine**. Reads parquet directly from MinIO/S3 via `httpfs`, does all compute, returns Arrow. | Metadata, catalog |
 | **PyIceberg** | The **catalog + metadata + write layer**. Resolves tables, gives schemas, prunes manifests/partitions to a concrete file list, commits new snapshots. | Compute |
 
@@ -45,7 +49,7 @@ df.write.mode("overwrite").saveAsTable("nyc.revenue_by_vendor")
 | **P2** | **PyIceberg plans, DuckDB executes.** Metadata work never touches DuckDB; compute never touches PyIceberg. |
 | **P3** | **Lazy by default.** Every transformation is tree-building. Only actions (`collect`, `show`, `count`, `write`, `toPandas`, …) execute. |
 | **P4** | **Prune early.** Partition + file pruning happens in PyIceberg *before* a byte is read. Projection pruning happens before the SQL is generated. |
-| **P5** | **Spark semantics are the spec.** Where DuckDB and Spark disagree, we bend DuckDB to Spark and write the divergence down. Silent behavioural drift is a bug. |
+| **P5** | **The reference semantics are the spec.** Where DuckDB and the reference disagree, we bend DuckDB to the reference and write the divergence down. Silent behavioural drift is a bug. |
 | **P6** | **Correctness over speed.** A slow correct path (Arrow fallback) always exists behind every fast path. |
 | **P7** | **Single node, all cores.** No cluster, no config knobs. Use every core, spill to disk when memory runs out. |
 
@@ -56,7 +60,7 @@ df.write.mode("overwrite").saveAsTable("nyc.revenue_by_vendor")
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  USER SURFACE  (pyspark-compatible)                              │
-│  SparkSession · DataFrame · Column · functions · Window · types  │
+│  Session · DataFrame · Column · functions · Window · types  │
 │  DataFrameReader / DataFrameWriter · Catalog · GroupedData       │
 └──────────────┬──────────────────────────────┬────────────────────┘
                │ df.filter(...)               │ spark.sql("SELECT ...")
@@ -109,7 +113,7 @@ df.write.mode("overwrite").saveAsTable("nyc.revenue_by_vendor")
 - sqlglot ships a working optimizer (`qualify`, `pushdown_predicates`,
   `pushdown_projections`, `optimize_joins`, `eliminate_subqueries`, `simplify`) —
   we get the boring 80% for free and write only Iceberg-specific rules.
-- Dialect translation Spark→DuckDB is sqlglot's core competency: `spark.sql()` can
+- Dialect translation Spark→DuckDB is sqlglot's core competency: `Session.sql()` can
   accept Spark SQL, Trino, Snowflake, or anything else, and it all lands in one tree.
 - **The cost:** sqlglot's tree is a *SQL* tree, not a relational algebra tree. Some
   things (scan-level metadata like "this table ref resolves to 412 parquet files") do
@@ -130,7 +134,7 @@ Transformation_Engine_08172026/
 │   ├── conf.py                   # SparkConf-alike + env/.env loading
 │   ├── errors.py                 # AnalysisException, ParseException, …
 │   ├── sql/                      # ← the pyspark-compatible surface
-│   │   ├── __init__.py           #   SparkSession, DataFrame, Row, …
+│   │   ├── __init__.py           #   Session, DataFrame, Row, …
 │   │   ├── session.py
 │   │   ├── dataframe.py
 │   │   ├── column.py
@@ -165,7 +169,7 @@ Transformation_Engine_08172026/
 │       └── divergence.md         #   documented Spark↔DuckDB behaviour differences
 ├── src/pyspark/                  # ← the shadow package: thin re-exports only
 │   ├── __init__.py               #   SparkConf, SparkContext stubs
-│   ├── sql/__init__.py           #   from icetl.sql import *   (SparkSession, DataFrame, …)
+│   ├── sql/__init__.py           #   from icetl.sql import *   (Session, DataFrame, …)
 │   ├── sql/functions.py          #   from icetl.sql.functions import *
 │   ├── sql/types.py · window.py · column.py · utils.py
 │   └── errors/__init__.py        #   AnalysisException, ParseException, …
@@ -213,7 +217,7 @@ packages = ["src/icetl", "src/pyspark"]   # ← ships the shadow package
 > `sqlglot` is pinned deliberately — its optimizer internals move between minors.
 > Everything installs into a project-local `.venv` created by `uv venv --python 3.12`.
 
-**Consequence of shadowing `pyspark` (decided 2026-08-17):** real PySpark cannot be
+**Consequence of shadowing `icetl` (decided 2026-08-17):** real PySpark cannot be
 installed in the same environment — the import name collides. So differential testing
 against a live Spark is off the table, and Spark fidelity is pinned down by
 **hand-written golden files** instead (§5). To keep that honest, every conformance
@@ -382,7 +386,7 @@ where one does not, Phase 14, the divergence is written down instead.
 ### Phase 0 — Scaffolding *(small)*
 - `uv` project, `.venv` on Python 3.12, `pyproject.toml` with all deps + `ipykernel`.
 - Package skeleton, `ruff` + `mypy` + `pytest` configured.
-- `conf.py`: catalog config from `.env` / `SparkSession.builder.config(...)`.
+- `conf.py`: catalog config from `.env` / `Session.builder.config(...)`.
 - `scripts/smoke_catalog.py`: connect to REST catalog, list `nyc`, describe
   `yellow_tripdata`, read 10 rows via DuckDB. **First proof of life.**
 - Local `SqlCatalog` test fixture + fixture-table generator.
@@ -390,7 +394,7 @@ where one does not, Phase 14, the divergence is written down instead.
 **Done when:** `uv run python scripts/smoke_catalog.py` prints 10 rows from your table.
 
 ### Phase 1 — End-to-end thin slice *(the important one)*
-- `SparkSession.builder…getOrCreate()`, `spark.table()`, `spark.sql()`.
+- `Session.builder…getOrCreate()`, `Session.table()`, `Session.sql()`.
 - `DataFrame`: `select`, `filter`/`where`, `limit`, `withColumn`, `withColumnRenamed`,
   `drop`, `alias`, `printSchema`, `schema`, `columns`, `explain`.
 - `Column` basics + `functions.col/lit/expr` and comparison/arithmetic operators.
@@ -615,27 +619,28 @@ decimal semantics were the point. That is the case to watch.
 
 | # | Decision |
 |---|---|
-| 1 | **Drop-in PySpark-compatible API** — success criterion is "existing script runs unchanged" |
+| 1 | ~~**Drop-in PySpark-compatible API**~~ — **superseded by decision 15**. The API is icetl's own; Spark remains the semantic reference only |
 | 2 | **sqlglot AST is the single IR** — DataFrame and SQL converge on one tree |
 | 3 | **PyIceberg file list → DuckDB `read_parquet`**, Arrow fallback only where delete files exist |
 | 4 | **Phase 1 = end-to-end thin slice** against `nyc.yellow_tripdata` |
 | 5 | **Write path covers both** bulk (append / overwrite / dynamic partition overwrite) **and** row-level (MERGE / UPDATE / DELETE) |
-| 6 | **Priority Spark features:** window functions, schema/DDL + evolution, complex types + explode. Python UDFs deferred to Phase 11 |
+| 6 | **Priority features:** window functions, schema/DDL + evolution, complex types + explode. Python UDFs deferred to Phase 11 |
 | 7 | **Python 3.12**, uv, all deps in `pyproject.toml`, `ipykernel` included |
-| 8 | **Shadow the `pyspark` import name** for zero-edit migration |
+| 8 | ~~**Shadow the `pyspark` import name**~~ — **superseded by decision 15**; the shadow package is deleted |
 | 9 | **Golden-file conformance**, no live PySpark in the dev environment |
 | 10 | **MERGE stays at Phase 8**, on top of a proven optimizer and write path |
 | 14 | **Decimal promotion deferred to Phase 14** (2026-08-30). Spark's decimal arithmetic result types are not reproduced: `+`/`-` already agree, `*` differs in precision, and `/` returns `DOUBLE` where Spark returns `DECIMAL`. Deferred rather than guessed, because the rule needs operand types and a wrong precision is worse than a documented divergence. No guard is possible without doing the work — detection needs the same type information as the fix. |
 | 13 | **No PySpark, ever — not even to generate test fixtures** (2026-08-30). Supersedes carry-over note 9, which wanted a golden corpus generated from real Spark in a throwaway venv. Conformance cases are instead written from Spark's published behaviour, each carrying a citation. **What this costs:** an edge case where Spark's real behaviour differs from its documentation will produce a confidently green test. Undocumented corners — NULL propagation, empty input, overflow, decimal promotion — are the exposure. `compat/divergence.md` marks conformance as *asserted, not machine-verified* so the limit is visible rather than implied. |
 | 12 | **Build the function library; use SQLFrame as a reference, not a dependency** (2026-08-30). Settles decision 8. Neither SQLFrame nor `duckdb.experimental.spark` implements Spark conformance — both return `inf` for `1/0`, both raise on `CAST('abc' AS INT)`, neither emits explicit NULLS FIRST/LAST — so §3.5 is ours either way, and neither can read Iceberg through our planner. SQLFrame also pins `sqlglot<30.13` against our 30.17. Its 478 function→sqlglot-node mappings are read as a lookup table (MIT); nothing is imported. |
+| 15 | **The PySpark compatibility surface is dropped** (2026-08-30). Supersedes decisions 1 and 8. icetl is an Iceberg + DuckDB library and no longer presents itself as Spark: `SparkSession` → `Session`, `PySpark*Error` → `Engine*Error`, the shadow `src/pyspark` package is deleted, `spark.*` config keys are replaced by `icetl.*` twins, and `F.spark_partition_id` is removed (273 names). **What stays, deliberately:** Spark 3.5 remains the *semantic* reference (P5) under the neutral name *the reference*, because having a written spec beats deciding each edge case ad hoc; and sqlglot's `"spark"` dialect stays, bound to `SQL_DIALECT`, because it names a SQL *grammar* — changing it would change the language accepted, not the branding. **What this costs:** any script doing `from pyspark.sql import SparkSession`, catching `PySparkTypeError`, or passing `spark.*` keys to `.config()` breaks. That is the intent, and no test covered the shadow package, so nothing in the suite regressed. |
 | 11 | **Copy-on-write for now; merge-on-read deferred** (2026-08-30). Every writer of the tables in scope rewrites data files, so no delete or position files exist and §3.3's hybrid split is not built. **Deferred, not dropped** — MoR *reading* is Phase 12, MoR *writing* is Phase 13. The assumption is asserted at scan time rather than trusted, because `read_parquet` cannot see a delete file and would return deleted rows reporting success. Phase 8 writes COW, which is what PyIceberg does natively. |
 
 ### Still open
 
 1. ~~**Catalog host**~~ — settled: `http://localhost:8182`, MinIO on `:9100`. In
    `.env` (gitignored); `.env.example` documents every key.
-2. **Package name** — `icetl`, or something you'd rather type? (Only affects
-   `pyproject.toml` and the internal import path; `pyspark` is the public surface.)
+2. ~~**Package name**~~ — settled by decision 15: `icetl` is the public surface,
+   imported as `from icetl.sql import Session, functions as F`.
 3. ~~**Golden conformance files**~~ — settled by decision 13: **no PySpark**, at any
    stage. Conformance cases are written from Spark's published behaviour with a
    citation each. See decision 13 for what that does and does not buy.

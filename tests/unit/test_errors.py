@@ -1,8 +1,8 @@
 """The exception hierarchy.
 
-These assertions look trivial but they are the drop-in contract: a script with
-`except AnalysisException:` around a missing table keeps working only if our
-inheritance matches PySpark's.
+These assertions look trivial but they are the stability contract: a script with
+`except AnalysisException:` around a missing table keeps working only if the
+inheritance stays as documented.
 """
 
 from __future__ import annotations
@@ -13,11 +13,11 @@ from icetl.errors import (
     AnalysisException,
     CatalogNotFoundError,
     ConfigurationError,
+    EngineException,
+    EngineNotImplementedError,
+    EngineValueError,
     IcetlError,
     ParseException,
-    PySparkException,
-    PySparkNotImplementedError,
-    PySparkValueError,
     TableNotFoundError,
     UnsupportedFeatureError,
 )
@@ -26,25 +26,25 @@ from icetl.errors import (
 @pytest.mark.parametrize(
     ("error", "expected_bases"),
     [
-        (AnalysisException, (PySparkException, IcetlError, Exception)),
+        (AnalysisException, (EngineException, IcetlError, Exception)),
         (ParseException, (AnalysisException,)),
         (TableNotFoundError, (AnalysisException,)),
         (CatalogNotFoundError, (AnalysisException,)),
-        (UnsupportedFeatureError, (PySparkNotImplementedError, NotImplementedError)),
-        (PySparkValueError, (PySparkException, ValueError)),
+        (UnsupportedFeatureError, (EngineNotImplementedError, NotImplementedError)),
+        (EngineValueError, (EngineException, ValueError)),
     ],
 )
-def test_inheritance_matches_pyspark(
+def test_inheritance_is_catchable_as_expected(
     error: type[Exception], expected_bases: tuple[type[Exception], ...]
 ) -> None:
     for base in expected_bases:
         assert issubclass(error, base), f"{error.__name__} must be catchable as {base.__name__}"
 
 
-def test_configuration_error_is_not_a_pyspark_exception() -> None:
-    """Our setup being wrong is not a condition a Spark script would handle."""
+def test_configuration_error_is_not_an_engine_exception() -> None:
+    """Our setup being wrong is not a condition a script would handle."""
     assert issubclass(ConfigurationError, IcetlError)
-    assert not issubclass(ConfigurationError, PySparkException)
+    assert not issubclass(ConfigurationError, EngineException)
 
 
 def test_error_class_accessors() -> None:
@@ -73,6 +73,6 @@ def test_unsupported_feature_names_the_phase() -> None:
 
 
 def test_value_error_is_catchable_both_ways() -> None:
-    for catch in (ValueError, PySparkException):
+    for catch in (ValueError, EngineException):
         with pytest.raises(catch):
-            raise PySparkValueError("bad argument")
+            raise EngineValueError("bad argument")

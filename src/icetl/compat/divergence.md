@@ -1,28 +1,47 @@
-# Spark ↔ DuckDB divergences
+# Reference ↔ DuckDB divergences
 
-Where Spark and DuckDB disagree, Spark is the spec (P5). Each row below is either a
-**translation rule** we implement, or a **documented divergence** we do not emulate and
-say so loudly. Silent behavioural drift is a bug.
+## What "the reference" means
+
+icetl is not Spark and does not present a Spark API. But its semantics are not invented
+either: where DuckDB's behaviour is a defensible choice rather than the only one, this
+library follows **Apache Spark 3.5.0** — referred to throughout as *the reference*, *the
+reference engine* or *the reference semantics*, and exposed in code as
+`REFERENCE_SEMANTICS_VERSION`.
+
+That choice is about having *a* specification rather than deciding each edge case ad
+hoc. Nothing here executes on Spark, links against it, or requires it installed.
+
+One related survivor is worth naming so it does not read as an oversight: sqlglot's SQL
+grammar for parsing and rendering is its `"spark"` dialect, bound to the constant
+`SQL_DIALECT` in `icetl/compat/__init__.py`. That string is an argument value in
+sqlglot's API naming a *grammar* — changing it would change the SQL accepted, which is a
+behaviour change rather than a rename.
+
+## The rules
+
+Where the reference and DuckDB disagree, the reference is the spec (P5). Each row below
+is either a **translation rule** we implement, or a **documented divergence** we do not
+emulate and say so loudly. Silent behavioural drift is a bug.
 
 This file is written as the rules land, not afterwards. Anything marked *planned* has
 no code behind it yet.
 
 **How these were established.** Every claim about DuckDB below was executed and
-observed. Every claim about *Spark* is taken from its published behaviour and cited,
-**not** verified against a running Spark — decision 13 rules out a JVM at any stage.
-So a case where Spark's real behaviour differs from its documentation would show up
-here as a confident ✅. The exposure is the undocumented corners: NULL propagation on
-unusual inputs, empty input, overflow, and decimal promotion.
+observed. Every claim about the *reference* is taken from Spark 3.5's published
+behaviour and cited, **not** verified against a running Spark — decision 13 rules out a
+JVM at any stage. So a case where its real behaviour differs from its documentation
+would show up here as a confident ✅. The exposure is the undocumented corners: NULL
+propagation on unusual inputs, empty input, overflow, and decimal promotion.
 
 | Status | Meaning |
 |---|---|
 | ✅ | Translation rule implemented and covered by a conformance case |
 | 📋 | Planned — the phase that will deliver it is named |
-| ⚠️ | Documented divergence: we do **not** match Spark, deliberately |
+| ⚠️ | Documented divergence: we do **not** match the reference, deliberately |
 
 ## Ordering and nulls
 
-| Behaviour | Spark | DuckDB | Rule | Status |
+| Behaviour | Reference | DuckDB | Rule | Status |
 |---|---|---|---|---|
 | `ORDER BY x ASC` nulls | first | **last** | always emit explicit `NULLS FIRST` | ✅ |
 | `ORDER BY x DESC` nulls | last | **last** | emit explicit `NULLS LAST` anyway | ✅ |
@@ -34,21 +53,21 @@ unusual inputs, empty input, overflow, and decimal promotion.
 
 ## Casting and arithmetic
 
-| Behaviour | Spark | DuckDB | Rule | Status |
+| Behaviour | Reference | DuckDB | Rule | Status |
 |---|---|---|---|---|
 | `CAST('abc' AS INT)` | `NULL` (non-ANSI) | error | `TRY_CAST` by default; `spark.sql.ansi.enabled=true` opts into strict. An explicit `try_cast(...)` stays lenient in both modes | ✅ |
-| `1/0` | `NULL` | `inf` | guarded division. sqlglot's Spark parser already emits the `NULLIF`, so both surfaces agree with no rule of ours | ✅ |
+| `1/0` | `NULL` | `inf` | guarded division. sqlglot's the reference parser already emits the `NULLIF`, so both surfaces agree with no rule of ours | ✅ |
 | `x % 0` | `NULL` | `NULL` | no rule needed | ✅ |
 | Integer overflow | wraps | error | not emulated — we error. `ansi_mode` does not change this; DuckDB cannot be asked to wrap | ⚠️ |
-| Decimal promotion | Spark's precision rules | DuckDB's, and division falls to `DOUBLE` | explicit cast per Spark's rules | 📋 **deferred to Phase 14** — see below |
+| Decimal promotion | the reference's precision rules | DuckDB's, and division falls to `DOUBLE` | explicit cast per the reference's rules | 📋 **deferred to Phase 14** — see below |
 
 ### Decimal promotion — measured, not yet fixed
 
-Spark derives the result type of decimal arithmetic from the operand types by a fixed
+the reference derives the result type of decimal arithmetic from the operand types by a fixed
 rule, then clamps precision to 38. DuckDB has its own rules. Both were executed; this
 is what they give for `DECIMAL(10,2) op DECIMAL(10,2)`:
 
-| Operation | Spark's rule | Spark result | DuckDB result | Same? |
+| Operation | the reference's rule | the reference result | DuckDB result | Same? |
 |---|---|---|---|---|
 | `a + b` | precision `max(s1,s2) + max(p1-s1, p2-s2) + 1`, scale `max(s1,s2)` | `DECIMAL(11,2)` | `DECIMAL(11,2)` | ✅ |
 | `a * b` | precision `p1+p2+1`, scale `s1+s2` | `DECIMAL(21,4)` | `DECIMAL(18,4)` | ❌ precision |
@@ -60,7 +79,7 @@ whole reason a monetary column is a decimal. Addition already agrees.
 **Deferred to Phase 14** (decision 14). The rule needs the *operand* types, and the
 type of a sub-expression is only known after binding. The vehicle is sqlglot's
 `annotate_types`, which the optimizer pipeline currently omits; adding it and then
-emitting an explicit cast per Spark's formula is the shape of the work. Doing it by
+emitting an explicit cast per the reference's formula is the shape of the work. Doing it by
 guesswork -- casting without knowing the operand types -- would produce a confidently
 wrong precision, which is worse than an honest divergence.
 
@@ -74,7 +93,7 @@ semantics were the reason for the column. Addition and subtraction already agree
 
 ## Operators and functions
 
-| Behaviour | Spark | DuckDB | Rule | Status |
+| Behaviour | Reference | DuckDB | Rule | Status |
 |---|---|---|---|---|
 | `a <=> b` | null-safe equality | — | `IS NOT DISTINCT FROM`; `Column.eqNullSafe` builds the same node | ✅ |
 | `concat(a, NULL)` | `NULL` | skips the NULL | generate `a \|\| b`, which propagates | ✅ |
@@ -94,6 +113,63 @@ semantics were the reason for the column. Addition and subtraction already agree
 | `explode(arr)` | row per element, drops empty | — | `UNNEST` | 📋 Phase 6 |
 | `explode_outer(arr)` | keeps empty as NULL | — | `LEFT JOIN UNNEST` | 📋 Phase 6 |
 | `df.join(o, "k")` | one `k` column | two | rewrite to `USING` + explicit projection | 📋 Phase 4 |
+| `rint(2.5)` | `2.0` (HALF_EVEN) | `round` gives `3` | pick the even neighbour on an exact tie, defer to `round` otherwise | ✅ |
+| `weekday` | Monday = 0 | `dayofweek` is Sunday = 0 | `(dayofweek + 6) % 7`, a *different* shift from `dayofweek`'s | ✅ |
+| `next_day(d, day)` | strictly after `d` | — | `(target - dow + 7) % 7`, mapping a zero delta to 7 | ✅ |
+| `array_size(NULL)` | `NULL` | `len` gives `NULL` | no rule needed — but `size(NULL)` is `-1`, so the two are not aliases | ✅ |
+| `get(arr, i)` | 0-indexed | 1-indexed | `+ 1`; `element_at` stays 1-indexed, as the reference has it both ways | ✅ |
+| `array_except` | de-duplicates | `list_filter` does not | wrap in `list_distinct` | ✅ |
+| `split_part` out of range | `""` | `NULL` | coalesce to `""` | ✅ |
+| `regexp_substr` no match | `NULL` | `regexp_extract` gives `""` | guard with `regexp_matches`, so an empty *match* stays distinguishable from no match | ✅ |
+| `find_in_set(x, s)` where `x` holds a comma | `0` | would match a run of fields | explicit `CASE` | ✅ |
+| `shiftrightunsigned` | Java `>>>` | no unsigned shift; `UBIGINT` rejects a negative | widen to `HUGEINT`, add 2^64, shift, narrow back | ✅ |
+| `octet_length` | bytes | `length` counts characters | `strlen`, which is DuckDB's byte count | ✅ |
+| `1.0 / 0.0` in the optimizer | `NULL` | rule raised `decimal.DivisionByZero` | widen `optimize_plan`'s guard to `ArithmeticError` — see below | ✅ |
+| `date_part('DOW', d)` | Sunday = 1 | Sunday = 0 | **refused**, naming `dayofweek`/`weekday` instead of translating | ⚠️ |
+| `xxhash64` / `hash` | specific seeded algorithms | DuckDB's own | values are stable within a query and do **not** match the reference's | ⚠️ |
+| `log1p` / `expm1` | `Math.log1p` / `Math.expm1` | absent | computed as `ln(1 + x)` / `exp(x) - 1`, which drift in the last digits near zero | ⚠️ |
+| `rand(seed)` / `randn(seed)` | reproducible | seeds per *connection*, not per expression | **refused** — accepting it would silently lose the reproducibility the argument is for | ⚠️ |
+| `try_add` / `try_subtract` / `try_multiply` | `NULL` on overflow | raises, and has no `TRY` expression | not implemented; see below | 📋 |
+| `crc32`, `soundex`, `typeof`, `input_file_name` | — | no DuckDB equivalent whose output matches | not implemented; see below | 📋 |
+| `to_utc_timestamp` / `from_utc_timestamp` / `current_timezone` | — | needs the ICU extension | not implemented; see below | 📋 |
+| `monotonically_increasing_id` | — | needs a window function | 📋 Phase 5, with `Column.over` |
+
+### Functions left unimplemented, and why
+
+Each of these has a DuckDB spelling that *looks* close enough to use. Writing one down
+here was cheaper than shipping a function that returns a plausible wrong answer.
+
+| Function | What stops it |
+|---|---|
+| `try_add`, `try_subtract`, `try_multiply` | Their whole contract is NULL on overflow. DuckDB raises on overflow and has no `TRY(...)` expression to catch it — only `TRY_CAST`. Computing in `HUGEINT` and range-checking works for integers and silently truncates a `DOUBLE`, so it would fix the rare case by breaking the common one. `try_divide` **is** implemented: division by zero is detectable without any of that. |
+| `crc32` | A specific checksum polynomial. DuckDB has no `crc32`, and no other hash is a substitute for a value that is usually compared against one some other system computed. |
+| `soundex` | Not in DuckDB. A phonetic key is only useful if it is *the same* phonetic key. |
+| `typeof` | DuckDB answers `INTEGER`/`VARCHAR`; the reference answers `int`/`string`. A mapping table would cover the common types and quietly mislabel the rest. |
+| `input_file_name` | DuckDB exposes a filename only as a `read_parquet` option, and the scan planner builds that relation itself. Reachable, but it is scan-planner work rather than a function. |
+| `to_utc_timestamp`, `from_utc_timestamp`, `current_timezone` | Need DuckDB's ICU extension, which is a new load-time dependency — and `exec/engine.py` deliberately loads extensions lazily and offline-safely. Worth doing as a decision, not as a side effect of a function. |
+| `array_insert`, `shuffle` | No DuckDB primitive. `array_insert` also pads with NULLs and accepts a negative position, which is enough behaviour to want a fixture rather than a one-liner. |
+| `monotonically_increasing_id` | Needs `row_number() over ()`. Phase 5 owns windows, and `Column.over` already raises for the same reason. |
+
+### The optimizer's rule guard and `ArithmeticError` (2026-08-30)
+
+`SELECT 1.0 / 0.0` crashed, on **both** surfaces, with `decimal.DivisionByZero` raised
+from inside sqlglot's `simplify` rule. the reference's answer is NULL.
+
+The cause is worth keeping: `optimize_plan` catches `OptimizeError`, `KeyError`,
+`ValueError` and `TypeError`, which is every way a rule was known to fail. But
+`simplify` *constant-folds literal arithmetic*, and arithmetic has its own exception
+tree — `decimal.DivisionByZero` is an `ArithmeticError`, so it escaped the guard and
+Phase 2's "a rule that fails costs only that rule" did not hold.
+
+The integer spelling `1 / 0` — which the conformance suite did test, on both surfaces —
+never reached it: `simplify` declines to fold integer division at all, calling it unsafe
+across engines. So the bug needed a *decimal* literal to appear, and the obvious test
+was the one shape that could not find it.
+
+`ArithmeticError` is now in the guard, which also covers `OverflowError` and
+`decimal.InvalidOperation` arriving the same way. Degrading is safe here because the
+the reference parser's own `NULLIF` guard is still in the tree, so the unoptimized plan returns
+the reference's NULL.
 
 ## Confirmed as already matching
 
@@ -109,7 +185,7 @@ release cannot drift without the suite noticing.
 
 ## Reading Iceberg through DuckDB
 
-Not Spark-vs-DuckDB but engine-vs-format: places where handing DuckDB an Iceberg
+Not the reference-vs-DuckDB but engine-vs-format: places where handing DuckDB an Iceberg
 table's files would quietly answer a different question than Iceberg does. Each is a
 silent wrong answer if unhandled, which is why each has a fixture rather than a note.
 
@@ -121,7 +197,7 @@ silent wrong answer if unhandled, which is why each has a fixture rather than a 
 | Hive partitioning | DuckDB auto-detects `key=value` directories, which an Iceberg warehouse is full of, and synthesises the column from the *path* with a type-cast — a `string` partition column comes back `DATE`. Iceberg's directory holds the *transformed* value, not the column's | `hive_partitioning => false`, always | ✅ |
 | Type promotion (int→long) | branch types must agree across a UNION | explicit `CAST` in the per-group projection | ✅ |
 | Stats-based file pruning | PyIceberg prunes on min/max, which is approximate: a straddling file is kept and its non-matching rows come back | the pushed filter is **always** left in the generated SQL as well | ✅ |
-| Bare date vs `timestamp` | SQL, Spark and DuckDB all read `ts >= '2024-01-01'` as midnight that day. PyIceberg demands full ISO-8601 and *raises* from inside `plan_files()` rather than declining | widen a date-only literal to `T00:00:00` for `timestamp` columns, then bind-validate every predicate before use, so one PyIceberg dislikes costs only its own conjunct | ✅ |
+| Bare date vs `timestamp` | SQL, the reference and DuckDB all read `ts >= '2024-01-01'` as midnight that day. PyIceberg demands full ISO-8601 and *raises* from inside `plan_files()` rather than declining | widen a date-only literal to `T00:00:00` for `timestamp` columns, then bind-validate every predicate before use, so one PyIceberg dislikes costs only its own conjunct | ✅ |
 | Bare date vs `timestamptz` | a bare date carries no zone; DuckDB resolves it against the session's, so assuming UTC could move the boundary and prune away wanted rows | not widened — the conjunct stays in SQL and prunes nothing | ⚠️ |
 | `ORDER BY <output alias>` | `qualify` leaves such a reference unqualified because it names the projection, not the table. Read as an unattributable column it disabled projection pushdown for the whole query | unqualified names matching an output alias are recognised as projection references; ones that also name a real column are included in the scan (a safe superset) | ✅ |
 
@@ -135,11 +211,10 @@ silent wrong answer if unhandled, which is why each has a fixture rather than a 
 
 ## Environment-level divergences
 
-Not Spark-vs-DuckDB, but differences a migrating script will notice.
+Not reference-vs-DuckDB, but differences worth knowing at the environment level.
 
 | Behaviour | Note | Status |
 |---|---|---|
-| `pyspark.__version__` | reports `3.5.0` (the semantics we target), not icetl's version. `pyspark.__icetl_version__` gives ours. | ✅ |
-| Real PySpark cannot be co-installed | the shadow package owns the `pyspark` import name (decision 8) | ⚠️ |
+| `Session.version` | reports icetl's own version. `Session.reference_semantics` reports the release the rules are checked against (`3.5.0`). | ✅ |
 | `getSqlState()` | always returns `None`; we do not model SQLSTATE codes | ⚠️ |
-| `pandas` 3.x | the dependency floor `>=2.2` resolves to pandas 3.x, whose default string dtype differs from the `object` dtype Spark's `toPandas()` yields | 📋 still open — carried to Phase 3 |
+| `pandas` 3.x | the dependency floor `>=2.2` resolves to pandas 3.x, whose default string dtype differs from the `object` dtype `toPandas()` is expected to yield | ✅ `exec/result.py` rebuilds string columns from `to_pylist()`, which corrects the dtype and the `nan`-vs-`None` sentinel in one pass |

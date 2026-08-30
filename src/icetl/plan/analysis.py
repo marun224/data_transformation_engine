@@ -1,6 +1,6 @@
 """Working out a plan's output schema, and failing early when it has none.
 
-Spark analyses eagerly: `df.select("typo")` raises `AnalysisException` there and
+The reference engine analyses eagerly: `df.select("typo")` raises `AnalysisException` there and
 then, not later at `collect()`. Reproducing that needs a binder, and we already
 depend on one -- so rather than hand-rolling type inference, we run the plan against
 **zero-row Arrow views** of its source tables on a throwaway DuckDB connection. No
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
     from icetl.plan.builder import ScanSource
 
-__all__ = ["PlanAnalyzer", "arrow_to_spark_schema", "arrow_to_spark_type"]
+__all__ = ["PlanAnalyzer", "arrow_to_datatype", "arrow_to_struct_type"]
 
 
 # Arrow types with no parameters, matched by identity against the singletons.
@@ -64,8 +64,8 @@ _SCALAR_TYPES: list[tuple[pa.DataType, DataType]] = [
     (pa.int16(), ShortType()),
     (pa.int32(), IntegerType()),
     (pa.int64(), LongType()),
-    # Spark has no unsigned types; each widens to the smallest signed type that
-    # holds it, which is what Spark's own Arrow reader does.
+    # The reference engine has no unsigned types; each widens to the smallest signed type that
+    # holds it, which is what the reference engine's own Arrow reader does.
     (pa.uint8(), ShortType()),
     (pa.uint16(), IntegerType()),
     (pa.uint32(), LongType()),
@@ -83,56 +83,51 @@ _SCALAR_TYPES: list[tuple[pa.DataType, DataType]] = [
 ]
 
 
-def arrow_to_spark_type(arrow_type: pa.DataType) -> DataType:
-    """Map one Arrow type onto Spark's."""
-    for candidate, spark_type in _SCALAR_TYPES:
+def arrow_to_datatype(arrow_type: pa.DataType) -> DataType:
+    """Map one Arrow type onto the reference engine's."""
+    for candidate, datatype in _SCALAR_TYPES:
         if arrow_type.equals(candidate):
-            return spark_type
+            return datatype
 
     if pa.types.is_decimal(arrow_type):
         return DecimalType(arrow_type.precision, arrow_type.scale)
     if pa.types.is_timestamp(arrow_type):
-        # A zone means an instant (Spark `TIMESTAMP`); none means wall-clock
+        # A zone means an instant (the reference engine `TIMESTAMP`); none means wall-clock
         # (`TIMESTAMP_NTZ`). This is the same split Iceberg makes between
         # `timestamptz` and `timestamp`.
         return TimestampType() if arrow_type.tz else TimestampNTZType()
     if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
-        return ArrayType(
-            arrow_to_spark_type(arrow_type.value_type), arrow_type.value_field.nullable
-        )
+        return ArrayType(arrow_to_datatype(arrow_type.value_type), arrow_type.value_field.nullable)
     if pa.types.is_fixed_size_list(arrow_type):
-        return ArrayType(
-            arrow_to_spark_type(arrow_type.value_type), arrow_type.value_field.nullable
-        )
+        return ArrayType(arrow_to_datatype(arrow_type.value_type), arrow_type.value_field.nullable)
     if pa.types.is_map(arrow_type):
         return MapType(
-            arrow_to_spark_type(arrow_type.key_type),
-            arrow_to_spark_type(arrow_type.item_type),
+            arrow_to_datatype(arrow_type.key_type),
+            arrow_to_datatype(arrow_type.item_type),
             arrow_type.item_field.nullable,
         )
     if pa.types.is_struct(arrow_type):
         return StructType(
             [
-                StructField(field.name, arrow_to_spark_type(field.type), field.nullable)
+                StructField(field.name, arrow_to_datatype(field.type), field.nullable)
                 for field in arrow_type
             ]
         )
     if pa.types.is_uint64(arrow_type):
-        # Would need Spark's DecimalType(20, 0) to stay lossless. Iceberg cannot
+        # Would need the reference engine's DecimalType(20, 0) to stay lossless. Iceberg cannot
         # produce one, so raising beats silently truncating.
         raise UnsupportedFeatureError(
-            "Reading a uint64 column (Spark has no unsigned 64-bit type)", phase="Phase 3"
+            "Reading a uint64 column (there is no unsigned 64-bit type)", phase="Phase 3"
         )
-    raise UnsupportedFeatureError(f"Mapping the Arrow type {arrow_type} to Spark", phase="Phase 3")
+    raise UnsupportedFeatureError(
+        f"Mapping the Arrow type {arrow_type} to the reference engine", phase="Phase 3"
+    )
 
 
-def arrow_to_spark_schema(schema: pa.Schema) -> StructType:
-    """Map a whole Arrow schema onto a Spark `StructType`."""
+def arrow_to_struct_type(schema: pa.Schema) -> StructType:
+    """Map a whole Arrow schema onto a `StructType`."""
     return StructType(
-        [
-            StructField(field.name, arrow_to_spark_type(field.type), field.nullable)
-            for field in schema
-        ]
+        [StructField(field.name, arrow_to_datatype(field.type), field.nullable) for field in schema]
     )
 
 
@@ -179,7 +174,7 @@ class PlanAnalyzer:
             result = self.connection.execute(wrapped).to_arrow_table()
         except duckdb.Error as exc:
             raise AnalysisException(_analysis_message(exc)) from exc
-        return arrow_to_spark_schema(result.schema)
+        return arrow_to_struct_type(result.schema)
 
     def close(self) -> None:
         with self._lock:
@@ -190,7 +185,7 @@ class PlanAnalyzer:
 
 
 def _analysis_message(exc: duckdb.Error) -> str:
-    """Turn a DuckDB binder complaint into something a Spark user recognises.
+    """Turn a DuckDB binder complaint into something a user recognises.
 
     DuckDB prefixes its own error class and often appends a `LINE 1: ...` excerpt of
     our generated SQL, which is noise to someone who wrote a DataFrame call. The

@@ -1,6 +1,6 @@
 """The logical plan: one sqlglot expression tree, shared by both user surfaces.
 
-`spark.sql("...")` and `df.filter(...)` produce the *same* kind of object (P1), so
+`Session.sql("...")` and `df.filter(...)` produce the *same* kind of object (P1), so
 everything downstream is written once and covers both:
 
     build  ->  analyse  ->  bind a schema  ->  optimize  ->  read the pruning facts
@@ -11,7 +11,7 @@ everything downstream is written once and covers both:
 of them degrades to "read everything" rather than failing.
 """
 
-from icetl.plan.analysis import PlanAnalyzer, arrow_to_spark_schema, arrow_to_spark_type
+from icetl.plan.analysis import PlanAnalyzer, arrow_to_datatype, arrow_to_struct_type
 from icetl.plan.annotations import PlanAnnotations, ScanRequest
 from icetl.plan.builder import (
     ScanSource,
@@ -35,8 +35,8 @@ __all__ = [
     "ScanRequest",
     "ScanSource",
     "SchemaBinder",
-    "arrow_to_spark_schema",
-    "arrow_to_spark_type",
+    "arrow_to_datatype",
+    "arrow_to_struct_type",
     "as_expression",
     "collect_source_keys",
     "describe_predicate",

@@ -234,7 +234,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Override a config key, e.g. --set spark.sql.catalog.rest.uri=http://host:8182",
+        help="Override a config key, e.g. --set icetl.catalog.rest.uri=http://host:8182",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="show config, SQL, tracebacks")
     return parser.parse_args(argv)

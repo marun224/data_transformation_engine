@@ -138,7 +138,7 @@ class ColumnResolver:
     def normalise_literal(self, name: str, value: Any) -> Any:
         """Spell `value` the way PyIceberg's literal binding expects for that column.
 
-        SQL is relaxed about timestamps -- Spark and DuckDB both read
+        SQL is relaxed about timestamps -- the reference engine and DuckDB both read
         `tpep_pickup_datetime >= '2024-01-01'` as midnight on that day. PyIceberg is
         strict, and rejects anything that is not full ISO-8601, by *raising* rather
         than declining. Widening the date here is what lets the most ordinary filter

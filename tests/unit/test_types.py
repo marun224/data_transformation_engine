@@ -1,4 +1,4 @@
-"""The Spark type hierarchy, its two naming schemes, printSchema, and `Row`."""
+"""The reference engine type hierarchy, its two naming schemes, printSchema, and `Row`."""
 
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ class TestStructType:
 
 
 class TestTreeString:
-    """`printSchema()` output. The gutter and the per-level flag names are Spark's."""
+    """`printSchema()` output. The gutter and per-level flag names follow the reference."""
 
     def test_flat_schema(self) -> None:
         schema = StructType(
@@ -195,7 +195,7 @@ class TestRow:
         assert repr(row) == "Row(a=1, b='x')"
 
     def test_field_order_is_insertion_order(self) -> None:
-        # Spark 3.0 stopped sorting kwargs; `Row(b=1, a=2)` keeps b first.
+        # The reference engine 3.0 stopped sorting kwargs; `Row(b=1, a=2)` keeps b first.
         assert Row(b=1, a=2).__fields__ == ("b", "a")
 
     def test_unnamed_row_is_a_plain_tuple(self) -> None:

@@ -11,6 +11,7 @@ build/
 dist/
 
 # Tooling caches
+.tox/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -22,3 +23,5 @@ htmlcov/
 .scratch/
 *.duckdb
 *.duckdb.wal
+.idea
+*.iml

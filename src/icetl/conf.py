@@ -1,19 +1,22 @@
-"""Configuration: a SparkConf-alike plus resolution into typed settings.
+"""Configuration: a mutable key/value conf plus resolution into typed settings.
 
 Four layers, highest priority first:
 
-    1. `SparkSession.builder.config(...)` / `IcetlConf.set(...)`
+    1. `Session.builder.config(...)` / `IcetlConf.set(...)`
     2. process environment
     3. `.env` file
     4. built-in defaults
 
-Spark-style keys are accepted verbatim so an existing script's `.config(...)` calls
-keep meaning what they meant:
+Conf keys and environment variables are two spellings of the same setting:
 
-    spark.sql.catalog.<name>.uri            ==  ICETL_CATALOG_URI
-    spark.sql.catalog.<name>.warehouse      ==  ICETL_CATALOG_WAREHOUSE
-    spark.sql.catalog.<name>.s3.endpoint    ==  ICETL_S3_ENDPOINT
-    spark.sql.defaultCatalog                ==  ICETL_CATALOG_NAME
+    icetl.catalog.<name>.uri            ==  ICETL_CATALOG_URI
+    icetl.catalog.<name>.warehouse      ==  ICETL_CATALOG_WAREHOUSE
+    icetl.catalog.<name>.s3.endpoint    ==  ICETL_S3_ENDPOINT
+    icetl.defaultCatalog                ==  ICETL_CATALOG_NAME
+
+A scoped key names the catalog it configures, so several catalogs can be set up in
+one process: `icetl.catalog.prod.uri` and `icetl.catalog.staging.uri` coexist, and
+`icetl.defaultCatalog` picks which one an unqualified table reference resolves to.
 
 Per P7 ("no config knobs"), DuckDB threads and memory are left unset by default so
 DuckDB sizes them from the machine. Only spill-to-disk is configured up front,
@@ -46,9 +49,9 @@ __all__ = [
 _TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
 _FALSEY = frozenset({"0", "false", "no", "n", "off"})
 
-# Spark-style prefixes we understand.
-_SPARK_CATALOG_PREFIX = "spark.sql.catalog."
-_SPARK_DEFAULT_CATALOG = "spark.sql.defaultCatalog"
+# Prefix for per-catalog scoped keys: `icetl.catalog.<name>.<rest>`.
+_CATALOG_PREFIX = "icetl.catalog."
+_DEFAULT_CATALOG_KEY = "icetl.defaultCatalog"
 
 _DEFAULT_CATALOG_NAME = "rest"
 _DEFAULT_CATALOG_TYPE = "rest"
@@ -80,10 +83,10 @@ def _as_int(value: str | int | None, *, key: str) -> int | None:
 
 
 class IcetlConf:
-    """A mutable key/value bag with SparkConf's method names.
+    """A mutable key/value bag with a conf object's method names.
 
-    `SparkSession.builder.config(...)` writes here in Phase 1. Values are stored as
-    strings, as Spark does, so `.get()` round-trips whatever was set.
+    `Session.builder.config(...)` writes here in Phase 1. Values are stored as
+    strings, as the reference engine does, so `.get()` round-trips whatever was set.
     """
 
     def __init__(self, pairs: Mapping[str, Any] | None = None) -> None:
@@ -94,7 +97,7 @@ class IcetlConf:
 
     def set(self, key: str, value: Any) -> IcetlConf:
         if isinstance(value, bool):
-            # Spark renders booleans lowercase; `str(True)` would give "True".
+            # The reference engine renders booleans lowercase; `str(True)` would give "True".
             self._data[key] = "true" if value else "false"
         else:
             self._data[key] = str(value)
@@ -210,7 +213,7 @@ class CatalogSettings:
     type: str = _DEFAULT_CATALOG_TYPE
     uri: str | None = _DEFAULT_CATALOG_URI
     warehouse: str | None = None
-    # Anything else under `spark.sql.catalog.<name>.*`, passed through untouched.
+    # Anything else under `icetl.catalog.<name>.*`, passed through untouched.
     extra: Mapping[str, str] = field(default_factory=dict)
 
     def pyiceberg_properties(self, s3: S3Settings) -> dict[str, str]:
@@ -243,11 +246,11 @@ class EngineSettings:
 
 @dataclass(frozen=True)
 class SqlSettings:
-    """Spark semantics that a session can be asked to change."""
+    """Semantics a session can be asked to change."""
 
-    #: `spark.sql.ansi.enabled`. Off by default, as in Spark: a failed cast gives
-    #: NULL rather than raising. Turning it on opts into strict casting only -- it
-    #: does not make integer overflow wrap, which DuckDB cannot do. See
+    #: `icetl.ansiMode`. Off by default, as in the reference semantics: a failed
+    #: cast gives NULL rather than raising. Turning it on opts into strict casting
+    #: only -- it does not make integer overflow wrap, which DuckDB cannot do. See
     #: `compat/divergence.md`.
     ansi_mode: bool = False
 
@@ -323,31 +326,29 @@ class _Layers:
 
 
 def _resolve_catalog_name(layers: _Layers, conf: IcetlConf) -> str:
-    explicit = layers.lookup(
-        (_SPARK_DEFAULT_CATALOG, "icetl.catalog.name"), ("ICETL_CATALOG_NAME",)
-    )
+    explicit = layers.lookup((_DEFAULT_CATALOG_KEY, "icetl.catalog.name"), ("ICETL_CATALOG_NAME",))
     if explicit:
         return explicit
     # Fall back to whichever catalog the script configured, e.g. a lone
-    # `spark.sql.catalog.prod.uri` implies the catalog is called "prod".
+    # `icetl.catalog.prod.uri` implies the catalog is called "prod".
     named = {
-        key[len(_SPARK_CATALOG_PREFIX) :].split(".", 1)[0]
+        key[len(_CATALOG_PREFIX) :].split(".", 1)[0]
         for key, _ in conf.getAll()
-        if key.startswith(_SPARK_CATALOG_PREFIX)
+        if key.startswith(_CATALOG_PREFIX)
     }
     if len(named) == 1:
         return named.pop()
     if len(named) > 1:
         raise ConfigurationError(
             f"Several catalogs are configured ({', '.join(sorted(named))}) but none is "
-            f"marked as the default. Set `{_SPARK_DEFAULT_CATALOG}` or ICETL_CATALOG_NAME."
+            f"marked as the default. Set `{_DEFAULT_CATALOG_KEY}` or ICETL_CATALOG_NAME."
         )
     return _DEFAULT_CATALOG_NAME
 
 
 def _catalog_scoped(conf: IcetlConf, catalog_name: str) -> dict[str, str]:
-    """Collect `spark.sql.catalog.<name>.<rest>` into `{<rest>: value}`."""
-    prefix = f"{_SPARK_CATALOG_PREFIX}{catalog_name}."
+    """Collect `icetl.catalog.<name>.<rest>` into `{<rest>: value}`."""
+    prefix = f"{_CATALOG_PREFIX}{catalog_name}."
     return {key[len(prefix) :]: value for key, value in conf.getAll() if key.startswith(prefix)}
 
 
@@ -437,15 +438,13 @@ def resolve_settings(
 
     sql = SqlSettings(
         ansi_mode=_as_bool(
-            layers.lookup(("spark.sql.ansi.enabled", "icetl.ansiMode"), ("ICETL_ANSI_MODE",)),
-            key="spark.sql.ansi.enabled",
+            layers.lookup(("icetl.ansiMode",), ("ICETL_ANSI_MODE",)),
+            key="icetl.ansiMode",
             default=False,
         )
     )
 
-    namespace = layers.lookup(
-        ("icetl.defaultNamespace", "spark.sql.defaultDatabase"), ("ICETL_DEFAULT_NAMESPACE",)
-    )
+    namespace = layers.lookup(("icetl.defaultNamespace",), ("ICETL_DEFAULT_NAMESPACE",))
 
     return IcetlSettings(
         catalog=catalog,

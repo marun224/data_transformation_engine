@@ -26,7 +26,7 @@ import re
 
 __all__ = ["engine_path", "engine_paths", "is_object_store", "scheme_of"]
 
-# `s3a://`/`s3n://` are Hadoop-era spellings that appear in tables written by Spark.
+# `s3a://`/`s3n://` are Hadoop-era spellings that appear in tables written by the reference engine.
 # DuckDB's httpfs only knows `s3://`; the bucket/key after the scheme is identical.
 _S3_ALIASES = ("s3a://", "s3n://")
 

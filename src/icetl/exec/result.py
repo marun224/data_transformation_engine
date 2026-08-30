@@ -1,10 +1,10 @@
 """Turning an Arrow result into what the caller asked for: Rows, pandas, or text.
 
-Arrow's Python conversion and Spark's disagree on the nested types, so `to_pylist`
+Arrow's Python conversion and the reference engine's disagree on the nested types, so `to_pylist`
 output is walked against the schema rather than handed back raw:
 
-    struct  ->  dict            Spark yields a nested `Row`
-    map     ->  [(k, v), ...]   Spark yields a `dict`
+    struct  ->  dict            the reference engine yields a nested `Row`
+    map     ->  [(k, v), ...]   the reference engine yields a `dict`
     list    ->  list            already right, but its elements may not be
 
 The walk is skipped entirely for schemas with no struct or map in them, which is
@@ -24,21 +24,21 @@ if TYPE_CHECKING:
 
 __all__ = ["NULL_DISPLAY", "format_show", "to_pandas", "to_rows"]
 
-# How `show()` renders a NULL. Spark switched from `null` to `NULL` in 3.4
-# (matching how it renders the literal elsewhere), and `pyspark.__version__` here
+# How `show()` renders a NULL. The reference engine switched from `null` to `NULL` in 3.4
+# (matching how it renders the literal elsewhere), and `the reference API.__version__` here
 # claims 3.5.0, so `NULL` is the consistent choice. Recorded in divergence.md;
 # this constant is the single place to change it.
 NULL_DISPLAY = "NULL"
 
 _MIN_TRUNCATE = 4  # below this the "..." suffix would be longer than the cell
 
-# Spark pads every show() column out to at least three characters, so a table of
+# The reference engine pads every show() column out to at least three characters, so a table of
 # short names still reads as a table. Narrower columns would be a visible divergence.
 _MIN_COLUMN_WIDTH = 3
 
 
 def _convert(value: Any, data_type: DataType) -> Any:
-    """Reshape one Arrow-derived Python value into Spark's form."""
+    """Reshape one Arrow-derived Python value into the reference engine's form."""
     if value is None:
         return None
     if isinstance(data_type, StructType):
@@ -81,15 +81,15 @@ def _is_text_like(arrow_type: pa.DataType) -> bool:
 
 
 def to_pandas(table: pa.Table) -> pd.DataFrame:
-    """Convert to pandas with Spark's dtypes.
+    """Convert to pandas with the reference engine's dtypes.
 
-    Spark's `toPandas()` yields `object` columns holding `None` for missing strings.
+    The reference engine's `toPandas()` yields `object` columns holding `None` for missing strings.
     pandas 3 instead converts Arrow strings to its new `str` dtype, whose missing
     value is `nan` -- and `astype(object)` keeps the `nan`, so the sentinel has to be
     fixed as well as the dtype. Rebuilding from `to_pylist()` gets both right at once.
 
     Columns that are already `object` are left alone: that is the pandas 2 path,
-    where Arrow's own conversion already produces exactly what Spark would.
+    where Arrow's own conversion already produces exactly what the reference engine would.
 
     Without this, the same script would see a different dtype and a different null
     sentinel depending on which pandas happened to be installed. Recorded in
@@ -111,7 +111,7 @@ def _cell(value: Any, truncate: int) -> str:
     if value is None:
         return NULL_DISPLAY
     if isinstance(value, bool):
-        # Spark prints Scala booleans lowercase; Python's str() would capitalise.
+        # The reference engine prints Scala booleans lowercase; Python's str() would capitalise.
         text = "true" if value else "false"
     elif isinstance(value, Row):
         text = "{" + ", ".join(_cell(v, 0) for v in value) + "}"
@@ -138,7 +138,7 @@ def format_show(
 ) -> str:
     """Render `show()`'s output.
 
-    Matches Spark's layout, including its alignment rule: cells are right-justified
+    Matches the reference engine's layout, including its alignment rule: cells are right-justified
     when truncation is on and left-justified when it is off (`truncate=0`), which is
     what makes untruncated wide values readable.
     """

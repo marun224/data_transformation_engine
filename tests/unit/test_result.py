@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 from icetl.exec.result import NULL_DISPLAY, format_show, to_pandas, to_rows
-from icetl.plan.analysis import arrow_to_spark_schema, arrow_to_spark_type
+from icetl.plan.analysis import arrow_to_datatype, arrow_to_struct_type
 from icetl.types import (
     ArrayType,
     BinaryType,
@@ -42,7 +42,7 @@ def rows(*values: tuple) -> list[Row]:
 
 class TestArrowTypeMapping:
     @pytest.mark.parametrize(
-        ("arrow_type", "spark_type"),
+        ("arrow_type", "datatype"),
         [
             (pa.int32(), IntegerType()),
             (pa.int64(), LongType()),
@@ -58,26 +58,26 @@ class TestArrowTypeMapping:
             (pa.uint32(), LongType()),
         ],
     )
-    def test_scalar_types(self, arrow_type: pa.DataType, spark_type: DataType) -> None:
-        assert arrow_to_spark_type(arrow_type) == spark_type
+    def test_scalar_types(self, arrow_type: pa.DataType, datatype: DataType) -> None:
+        assert arrow_to_datatype(arrow_type) == datatype
 
-    def test_timestamp_zone_decides_the_spark_type(self) -> None:
+    def test_timestamp_zone_decides_the_datatype(self) -> None:
         # Iceberg's `timestamptz` vs `timestamp`, carried through Arrow.
-        assert arrow_to_spark_type(pa.timestamp("us", tz="UTC")) == TimestampType()
-        assert arrow_to_spark_type(pa.timestamp("us")) == TimestampNTZType()
+        assert arrow_to_datatype(pa.timestamp("us", tz="UTC")) == TimestampType()
+        assert arrow_to_datatype(pa.timestamp("us")) == TimestampNTZType()
 
     def test_nested_types(self) -> None:
-        assert arrow_to_spark_type(pa.list_(pa.int64())) == ArrayType(LongType(), True)
-        assert arrow_to_spark_type(pa.map_(pa.string(), pa.int64())) == MapType(
+        assert arrow_to_datatype(pa.list_(pa.int64())) == ArrayType(LongType(), True)
+        assert arrow_to_datatype(pa.map_(pa.string(), pa.int64())) == MapType(
             StringType(), LongType(), True
         )
-        assert arrow_to_spark_type(pa.struct([("a", pa.int64())])) == StructType(
+        assert arrow_to_datatype(pa.struct([("a", pa.int64())])) == StructType(
             [StructField("a", LongType(), True)]
         )
 
     def test_schema_preserves_field_order_and_nullability(self) -> None:
         schema = pa.schema([pa.field("a", pa.int64(), nullable=False), pa.field("b", pa.string())])
-        assert arrow_to_spark_schema(schema) == StructType(
+        assert arrow_to_struct_type(schema) == StructType(
             [StructField("a", LongType(), False), StructField("b", StringType(), True)]
         )
 
@@ -106,16 +106,16 @@ class TestToRows:
             {"person": [{"name": "ada"}], "tags": [["x"]], "scores": [[("a", 1)]]},
             schema=arrow_schema,
         )
-        [row] = to_rows(table, arrow_to_spark_schema(arrow_schema))
+        [row] = to_rows(table, arrow_to_struct_type(arrow_schema))
         assert row.person == Row(name="ada")
         assert row.tags == ["x"]
-        # Arrow hands maps back as pairs; Spark yields a dict.
+        # Arrow hands maps back as pairs; the reference engine yields a dict.
         assert row.scores == {"a": 1}
 
     def test_nulls_survive_conversion(self) -> None:
         arrow_schema = pa.schema([("person", pa.struct([("name", pa.string())]))])
         table = pa.table({"person": [None]}, schema=arrow_schema)
-        assert to_rows(table, arrow_to_spark_schema(arrow_schema))[0].person is None
+        assert to_rows(table, arrow_to_struct_type(arrow_schema))[0].person is None
 
     def test_empty_table_yields_no_rows(self) -> None:
         table = pa.schema(
@@ -126,7 +126,7 @@ class TestToRows:
 
 class TestToPandas:
     def test_strings_come_back_as_object_dtype(self) -> None:
-        # Spark's toPandas() yields `object`; pandas 3 would otherwise use `str`.
+        # The reference engine's toPandas() yields `object`; pandas 3 would otherwise use `str`.
         frame = to_pandas(pa.table({"s": ["a", None], "i": pa.array([1, 2], pa.int64())}))
         assert frame["s"].dtype == object
         assert str(frame["i"].dtype) == "int64"
@@ -137,7 +137,7 @@ class TestToPandas:
 
 
 class TestFormatShow:
-    def test_layout_matches_spark(self) -> None:
+    def test_layout_matches_the_reference(self) -> None:
         out = format_show(
             rows((1, "a", 1.5)), FLAT, n=20, truncate=20, vertical=False, has_more=False
         )
@@ -164,7 +164,7 @@ class TestFormatShow:
 
         untruncated = format_show(long_rows, FLAT, n=20, truncate=0, vertical=False, has_more=False)
         assert "|a-very-long-vendor-name|" in untruncated
-        # truncate=0 switches Spark to left-justified cells.
+        # truncate=0 switches the reference engine to left-justified cells.
         assert "|1  |" in untruncated
 
     def test_footer_appears_only_when_rows_were_dropped(self) -> None:
@@ -194,7 +194,7 @@ class TestFormatShow:
         )
         assert "|true|" in out
 
-    def test_nested_values_use_sparks_braces_and_arrows(self) -> None:
+    def test_nested_values_use_braces_and_arrows(self) -> None:
         schema = StructType(
             [
                 StructField("s", StructType([StructField("a", LongType())])),

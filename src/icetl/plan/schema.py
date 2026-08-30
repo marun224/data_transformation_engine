@@ -68,7 +68,7 @@ def iceberg_to_duckdb_type(iceberg_type: ice.IcebergType) -> str:
     """Spell one Iceberg type as DuckDB SQL.
 
     Iceberg's `timestamp` / `timestamptz` split is preserved rather than flattened:
-    it is the same distinction Spark draws between `TIMESTAMP_NTZ` and `TIMESTAMP`,
+    it is the same distinction the reference engine draws between `TIMESTAMP_NTZ` and `TIMESTAMP`,
     and losing it here would lose it everywhere downstream.
     """
     fixed = _PRIMITIVES.get(type(iceberg_type))

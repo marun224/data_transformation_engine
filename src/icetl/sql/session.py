@@ -1,4 +1,4 @@
-"""`SparkSession` -- the entry point, and the only thing that knows how to run a plan.
+"""`Session` -- the entry point, and the only thing that knows how to run a plan.
 
 The session owns the three long-lived pieces: the catalog registry, the DuckDB
 engine, and the analyzer. A DataFrame owns none of them; it holds a plan and asks the
@@ -7,8 +7,8 @@ matters because both user surfaces run through it:
 
     plan  ->  substitute sources  ->  generate DuckDB SQL  ->  execute
 
-`spark.sql()` and the DataFrame API differ only in how the plan is *built*. From the
-substitution step down there is one path (P1).
+`Session.sql()` and the DataFrame API differ only in how the plan is *built*. From
+the substitution step down there is one path (P1).
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ from sqlglot import exp
 
 from icetl import __version__
 from icetl.catalog import CatalogRegistry, TableResolver
+from icetl.compat import SQL_DIALECT
 from icetl.conf import IcetlConf, IcetlSettings, resolve_settings
-from icetl.errors import ParseException, PySparkTypeError, UnsupportedFeatureError
+from icetl.errors import EngineTypeError, ParseException, UnsupportedFeatureError
 from icetl.exec import DuckDBEngine
 from icetl.exec.scan_planner import ScanPlan, plan_scan
 from icetl.exec.source_sql import build_source
@@ -33,7 +34,7 @@ from icetl.plan.builder import ScanSource, collect_source_keys, source_table, su
 from icetl.plan.optimizer import OptimizedPlan, optimize_plan
 from icetl.plan.pushdown import extract_scan_requests
 from icetl.plan.schema import SchemaBinder
-from icetl.sql.conformance import apply_spark_semantics
+from icetl.sql.conformance import apply_compat_semantics
 from icetl.sql.dataframe import DataFrame
 
 if TYPE_CHECKING:
@@ -44,10 +45,11 @@ if TYPE_CHECKING:
 
     from icetl.types import StructType
 
-__all__ = ["CompiledPlan", "SparkSession"]
+__all__ = ["CompiledPlan", "Session"]
 
-# The PySpark version whose semantics we target. Scripts branch on it.
-SPARK_VERSION = "3.5.0"
+#: The release whose semantics the conformance rules are checked against.
+#: Reported by `Session.reference_semantics`, not by `Session.version`.
+REFERENCE_SEMANTICS_VERSION = "3.5.0"
 
 # Statement types Phase 1 can run. Everything else has a phase that owns it.
 _DDL_PHASES: dict[type[exp.Expression], tuple[str, str]] = {
@@ -72,7 +74,7 @@ class CompiledPlan:
 
 
 class RuntimeConfig:
-    """`spark.conf` -- get and set configuration on a live session."""
+    """`Session.conf` -- get and set configuration on a live session."""
 
     def __init__(self, conf: IcetlConf) -> None:
         self._conf = conf
@@ -87,17 +89,17 @@ class RuntimeConfig:
         self._conf.remove(key)
 
     def isModifiable(self, key: str) -> bool:
-        """Always True: nothing here is fixed at startup the way Spark's cluster is."""
+        """Always True: nothing here is fixed at startup the way a cluster would be."""
         return True
 
     def getAll(self) -> dict[str, str]:
         return dict(self._conf.getAll())
 
 
-class SparkSession:
+class Session:
     """A session over an Iceberg catalog, executed by DuckDB."""
 
-    _active: SparkSession | None = None
+    _active: Session | None = None
     _active_lock = threading.Lock()
 
     def __init__(
@@ -125,19 +127,14 @@ class SparkSession:
     # -- builder -----------------------------------------------------------
 
     class Builder:
-        """`SparkSession.builder.appName(...).config(...).getOrCreate()`."""
+        """`Session.builder.appName(...).config(...).getOrCreate()`."""
 
         def __init__(self) -> None:
             self._conf = IcetlConf()
             self._catalog: Catalog | None = None
 
-        def appName(self, name: str) -> SparkSession.Builder:
-            self._conf.set("spark.app.name", name)
-            return self
-
-        def master(self, master: str) -> SparkSession.Builder:
-            """Accepted and ignored -- there is no cluster to point at."""
-            self._conf.set("spark.master", master)
+        def appName(self, name: str) -> Session.Builder:
+            self._conf.set("icetl.appName", name)
             return self
 
         def config(
@@ -147,76 +144,66 @@ class SparkSession:
             conf: IcetlConf | None = None,
             *,
             map: Mapping[str, Any] | None = None,
-        ) -> SparkSession.Builder:
+        ) -> Session.Builder:
             if conf is not None:
                 self._conf.setAll(dict(conf.getAll()))
             if map is not None:
                 self._conf.setAll(map)
             if key is not None:
                 if value is None:
-                    raise PySparkTypeError(f"config({key!r}) needs a value.")
+                    raise EngineTypeError(f"config({key!r}) needs a value.")
                 self._conf.set(key, value)
             return self
 
-        def enableHiveSupport(self) -> SparkSession.Builder:
-            """Accepted and ignored -- catalogs are configured through `icetl.conf`."""
-            return self
-
-        def remote(self, url: str) -> SparkSession.Builder:
-            raise UnsupportedFeatureError(
-                f"Spark Connect (remote={url!r})",
-                hint="icetl runs in this process, so there is nothing to connect to",
-            )
-
-        def withCatalog(self, catalog: Catalog) -> SparkSession.Builder:
-            """Use an already-built PyIceberg catalog. Not part of PySpark's API."""
+        def withCatalog(self, catalog: Catalog) -> Session.Builder:
+            """Use an already-built PyIceberg catalog."""
             self._catalog = catalog
             return self
 
-        def getOrCreate(self) -> SparkSession:
+        def getOrCreate(self) -> Session:
             """Return the active session, or build one.
 
-            Matching Spark, configuration given here is applied to an existing
+            Matching the reference engine, configuration given here is applied to an existing
             session rather than replacing it -- but note that catalog settings are
             read when the session is built, so changing one afterwards has no effect
             until `stop()`.
             """
-            with SparkSession._active_lock:
-                active = SparkSession._active
+            with Session._active_lock:
+                active = Session._active
                 if active is not None and not active._stopped:
                     active._conf.setAll(dict(self._conf.getAll()))
                     return active
-                session = SparkSession(
+                session = Session(
                     settings=resolve_settings(self._conf),
                     conf=self._conf,
                     catalog=self._catalog,
                 )
-                SparkSession._active = session
+                Session._active = session
                 return session
 
-        def create(self) -> SparkSession:
+        def create(self) -> Session:
             """Build a new session even if one is already active."""
-            session = SparkSession(
+            session = Session(
                 settings=resolve_settings(self._conf), conf=self._conf, catalog=self._catalog
             )
-            with SparkSession._active_lock:
-                SparkSession._active = session
+            with Session._active_lock:
+                Session._active = session
             return session
 
     builder = Builder()
 
     @classmethod
-    def getActiveSession(cls) -> SparkSession | None:
+    def getActiveSession(cls) -> Session | None:
         active = cls._active
         return None if active is None or active._stopped else active
 
     @classmethod
-    def active(cls) -> SparkSession:
+    def active(cls) -> Session:
         session = cls.getActiveSession()
         if session is None:
             raise UnsupportedFeatureError(
-                "Using icetl without a SparkSession",
-                hint="Build one with SparkSession.builder.getOrCreate()",
+                "Using icetl without a Session",
+                hint="Build one with Session.builder.getOrCreate()",
             )
         return session
 
@@ -224,12 +211,16 @@ class SparkSession:
 
     @property
     def version(self) -> str:
-        """The Spark version whose semantics we target, not icetl's own version."""
-        return SPARK_VERSION
+        """icetl's own version."""
+        return __version__
 
     @property
-    def icetlVersion(self) -> str:
-        return __version__
+    def reference_semantics(self) -> str:
+        """The release whose behaviour the conformance rules are checked against.
+
+        Nothing here executes on that engine; it names the specification only.
+        """
+        return REFERENCE_SEMANTICS_VERSION
 
     @property
     def conf(self) -> RuntimeConfig:
@@ -237,37 +228,30 @@ class SparkSession:
 
     @property
     def settings(self) -> IcetlSettings:
-        """The resolved settings. Not part of PySpark's API."""
+        """The resolved settings."""
         return self._settings
 
     @property
     def catalog(self) -> Any:
-        raise UnsupportedFeatureError("spark.catalog", phase="Phase 9")
+        raise UnsupportedFeatureError("Session.catalog", phase="Phase 9")
 
     @property
     def read(self) -> Any:
         raise UnsupportedFeatureError(
-            "spark.read",
+            "Session.read",
             phase="Phase 11",
-            hint="Use spark.table() for Iceberg tables",
-        )
-
-    @property
-    def sparkContext(self) -> Any:
-        raise UnsupportedFeatureError(
-            "spark.sparkContext",
-            hint="There is no RDD layer here, and there will not be one",
+            hint="Use Session.table() for Iceberg tables",
         )
 
     @property
     def udf(self) -> Any:
-        raise UnsupportedFeatureError("spark.udf", phase="Phase 11")
+        raise UnsupportedFeatureError("Session.udf", phase="Phase 11")
 
     def createDataFrame(self, *args: Any, **kwargs: Any) -> DataFrame:
-        raise UnsupportedFeatureError("spark.createDataFrame", phase="Phase 4")
+        raise UnsupportedFeatureError("Session.createDataFrame", phase="Phase 4")
 
     def range(self, *args: Any, **kwargs: Any) -> DataFrame:
-        raise UnsupportedFeatureError("spark.range", phase="Phase 4")
+        raise UnsupportedFeatureError("Session.range", phase="Phase 4")
 
     # -- entry points ------------------------------------------------------
 
@@ -278,28 +262,28 @@ class SparkSession:
         here rather than at the first action.
         """
         if not isinstance(tableName, str):
-            raise PySparkTypeError(f"table() expects a name, got {type(tableName).__name__}.")
+            raise EngineTypeError(f"table() expects a name, got {type(tableName).__name__}.")
         source = self._source_for(tableName)
         plan = exp.select(exp.Star()).from_(source_table(tableName))
         return DataFrame(self, plan, {source.key: source})
 
     def sql(self, sqlQuery: str, **kwargs: Any) -> DataFrame:
-        """Run a Spark SQL query, producing the same kind of plan the API builds."""
+        """Run a SQL query, producing the same kind of plan the DataFrame API builds."""
         if kwargs:
             raise UnsupportedFeatureError(
-                f"spark.sql() named-argument substitution ({', '.join(sorted(kwargs))})",
+                f"Session.sql() named-argument substitution ({', '.join(sorted(kwargs))})",
                 phase="Phase 4",
             )
         if not isinstance(sqlQuery, str):
-            raise PySparkTypeError(f"sql() expects a string, got {type(sqlQuery).__name__}.")
+            raise EngineTypeError(f"sql() expects a string, got {type(sqlQuery).__name__}.")
         try:
-            statements = sqlglot.parse(sqlQuery, read="spark")
+            statements = sqlglot.parse(sqlQuery, read=SQL_DIALECT)
         except Exception as exc:
             raise ParseException(f"Could not parse the query: {exc}") from exc
 
         parsed = [s for s in statements if s is not None]
         if len(parsed) != 1:
-            raise ParseException(f"spark.sql() takes exactly one statement, got {len(parsed)}.")
+            raise ParseException(f"Session.sql() takes exactly one statement, got {len(parsed)}.")
         plan = parsed[0]
 
         for node_type, (keyword, phase) in _DDL_PHASES.items():
@@ -362,9 +346,10 @@ class SparkSession:
         to the Phase 1 behaviour rather than failing, so a plan the optimizer cannot
         bind still runs -- it just reads more than it needed to.
         """
-        # Spark semantics first, so the optimizer -- and therefore pushdown -- reasons
+        # The reference engine semantics first, so the optimizer -- and therefore pushdown --
+        # reasons
         # about the tree that will actually execute (PLAN.md 3.5).
-        conformed = apply_spark_semantics(plan, ansi_mode=self._settings.sql.ansi_mode)
+        conformed = apply_compat_semantics(plan, ansi_mode=self._settings.sql.ansi_mode)
         schema = self._binder.bind(sources)
         optimized = optimize_plan(conformed, schema, output_names)
 
@@ -399,7 +384,7 @@ class SparkSession:
     ) -> pa.Table:
         """Compile and run a plan, returning Arrow."""
         if self._stopped:
-            raise UnsupportedFeatureError("Using a SparkSession after stop()")
+            raise UnsupportedFeatureError("Using a Session after stop()")
         compiled = self._compile(plan, sources, output_names)
         paths = [path for scan in compiled.scans for group in scan.groups for path in group.paths]
         self._engine.ensure_object_store(paths)
@@ -413,16 +398,16 @@ class SparkSession:
         self._analyzer.close()
         self._registry.close()
         self._stopped = True
-        with SparkSession._active_lock:
-            if SparkSession._active is self:
-                SparkSession._active = None
+        with Session._active_lock:
+            if Session._active is self:
+                Session._active = None
 
-    def __enter__(self) -> SparkSession:
+    def __enter__(self) -> Session:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
 
     def __repr__(self) -> str:
-        name = self._conf.get("spark.app.name", "icetl")
-        return f"<SparkSession app={name!r} catalog={self._settings.catalog.name!r}>"
+        name = self._conf.get("icetl.appName", "icetl")
+        return f"<Session app={name!r} catalog={self._settings.catalog.name!r}>"

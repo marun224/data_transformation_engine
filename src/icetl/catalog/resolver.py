@@ -1,6 +1,6 @@
 """Turning a table reference string into a live PyIceberg table.
 
-Spark's rules, which we follow:
+The reference engine's rules, which we follow:
 
     "trips"                  -> default catalog, current namespace
     "nyc.trips"              -> default catalog, namespace `nyc`
@@ -9,7 +9,7 @@ Spark's rules, which we follow:
     "`odd name`.trips"       -> backticks quote a part containing dots or spaces
 
 The three-part case is genuinely ambiguous -- Iceberg allows multi-level namespaces,
-so `a.b.c` could be catalog `a` or namespace `a.b`. Spark resolves it by asking
+so `a.b.c` could be catalog `a` or namespace `a.b`. The reference engine resolves it by asking
 whether a catalog named `a` is registered, and so do we. `CatalogRegistry.is_known`
 answers without connecting, so resolution stays cheap.
 """
@@ -32,7 +32,7 @@ __all__ = ["ResolvedTable", "TableRef", "TableResolver", "parse_table_ref"]
 def _split_identifier(ref: str) -> list[str]:
     """Split a dotted identifier, honouring backtick quoting.
 
-    A doubled backtick inside a quoted part is a literal backtick, as in Spark.
+    A doubled backtick inside a quoted part is a literal backtick, as in the reference engine.
     """
     parts: list[str] = []
     current: list[str] = []
@@ -120,7 +120,7 @@ def parse_table_ref(
 class TableResolver:
     """Resolves reference strings against a `CatalogRegistry`.
 
-    Holds the current namespace, which `spark.catalog.setCurrentDatabase` mutates.
+    Holds the current namespace, which `TableResolver.set_current_namespace` mutates.
     """
 
     def __init__(

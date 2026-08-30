@@ -1,4 +1,4 @@
-"""Operator-facing diagnostics. Not part of the PySpark surface."""
+"""Operator-facing diagnostics. Not part of public surface."""
 
 from icetl.diagnostics.smoke import main, run_smoke_test
 

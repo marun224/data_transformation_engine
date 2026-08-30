@@ -1,4 +1,4 @@
-"""Configuration layering, Spark-key compatibility, and secret redaction."""
+"""Configuration layering, the reference engine-key compatibility, and secret redaction."""
 
 from __future__ import annotations
 
@@ -31,8 +31,8 @@ class TestIcetlConf:
         assert conf.get("a.b") == "1"
         assert conf.get("missing", "fallback") == "fallback"
 
-    def test_booleans_render_spark_style(self) -> None:
-        """Spark writes `true`, not Python's `True`; scripts compare against strings."""
+    def test_booleans_render_lowercase(self) -> None:
+        """Conf writes `true`, not Python's `True`; scripts compare against strings."""
         assert IcetlConf().set("k", True).get("k") == "true"
         assert IcetlConf().set("k", False).get("k") == "false"
 
@@ -58,7 +58,7 @@ class TestLayering:
 
     def test_conf_overrides_env(self) -> None:
         """`.config(...)` is the highest layer -- an explicit call always wins."""
-        conf = IcetlConf({"spark.sql.catalog.rest.uri": "http://from-conf:1"})
+        conf = IcetlConf({"icetl.catalog.rest.uri": "http://from-conf:1"})
         settings = resolve(conf, env={"ICETL_CATALOG_URI": "http://from-env:2"})
         assert settings.catalog.uri == "http://from-conf:1"
 
@@ -73,31 +73,29 @@ class TestLayering:
 
 
 class TestCatalogNaming:
-    def test_spark_default_catalog_key(self) -> None:
-        conf = IcetlConf({"spark.sql.defaultCatalog": "prod"})
+    def test_default_catalog_key(self) -> None:
+        conf = IcetlConf({"icetl.defaultCatalog": "prod"})
         assert resolve(conf).catalog.name == "prod"
 
     def test_single_configured_catalog_is_inferred(self) -> None:
-        """A lone `spark.sql.catalog.prod.uri` names the catalog without repeating it."""
-        conf = IcetlConf({"spark.sql.catalog.prod.uri": "http://prod:8182"})
+        """A lone `icetl.catalog.prod.uri` names the catalog without repeating it."""
+        conf = IcetlConf({"icetl.catalog.prod.uri": "http://prod:8182"})
         settings = resolve(conf)
         assert settings.catalog.name == "prod"
         assert settings.catalog.uri == "http://prod:8182"
 
     def test_ambiguous_catalogs_are_rejected(self) -> None:
         """Two catalogs and no default is a setup mistake worth failing loudly on."""
-        conf = IcetlConf(
-            {"spark.sql.catalog.a.uri": "http://a", "spark.sql.catalog.b.uri": "http://b"}
-        )
+        conf = IcetlConf({"icetl.catalog.a.uri": "http://a", "icetl.catalog.b.uri": "http://b"})
         with pytest.raises(ConfigurationError, match="none is marked as the default"):
             resolve(conf)
 
     def test_unmodelled_scoped_keys_flow_into_extra(self) -> None:
         conf = IcetlConf(
             {
-                "spark.sql.defaultCatalog": "prod",
-                "spark.sql.catalog.prod.uri": "http://prod",
-                "spark.sql.catalog.prod.header.X-Tenant": "acme",
+                "icetl.defaultCatalog": "prod",
+                "icetl.catalog.prod.uri": "http://prod",
+                "icetl.catalog.prod.header.X-Tenant": "acme",
             }
         )
         settings = resolve(conf)

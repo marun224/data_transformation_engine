@@ -1,23 +1,31 @@
-# icetl — a drop-in PySpark surface over Apache Iceberg, executed by DuckDB
+# icetl — a DataFrame and SQL surface over Apache Iceberg, executed by DuckDB
 
-Single-node ETL library. Your existing PySpark scripts run unchanged: the distribution
-ships a top-level `pyspark` package that shadows the real one.
+Single-node ETL library. Read and transform Iceberg tables with a lazy DataFrame API or
+plain SQL — the two are one code path, not two.
 
 ```python
-from pyspark.sql import SparkSession, functions as F  # <- this is us
+from icetl.sql import Session, functions as F
 
-spark = SparkSession.builder.appName("etl").getOrCreate()
-df = spark.table("nyc.yellow_tripdata").filter(F.col("VendorID") == 1)
+session = Session.builder.appName("etl").getOrCreate()
+df = session.table("nyc.yellow_tripdata").filter(F.col("VendorID") == 1)
 df.show()
 ```
 
 **sqlglot** is the single IR, **PyIceberg** plans and commits, **DuckDB** executes.
 See [PLAN.md](PLAN.md) for the full design, phases, and the decisions behind them.
 
+Where DuckDB's behaviour is a defensible choice rather than the only one, icetl follows
+**Apache Spark 3.5** as a written specification — `1/0` is NULL, a failed cast is NULL,
+`ORDER BY` puts nulls first ascending. That is a spec reference, not a dependency:
+nothing here runs on, links against, or requires Spark. Every place the two engines
+disagree is recorded in [divergence.md](src/icetl/compat/divergence.md).
+
 ## Status
 
-**Phase 0 — scaffolding.** Config, catalog resolution, DuckDB engine, and the
-connectivity smoke test. The DataFrame API arrives in Phase 1.
+**Phases 0–3 complete.** Config and catalog resolution, the DataFrame and SQL
+surfaces, the plan IR with predicate and projection pushdown, and a 273-name function
+library. Phase 4 adds joins, `groupBy().agg()` and set operations. See
+[STATUS.md](STATUS.md).
 
 ## Setup
 
@@ -39,6 +47,18 @@ Point it at a different table with `--namespace` / `--table`, and use `--verbose
 to see the generated SQL and the resolved (secret-redacted) configuration.
 
 ## Development
+
+```bash
+uv run tox                       # lint, mypy, tests against the built wheel, then dist/
+uv run tox -e py312              # just the tests
+uv run tox -e dist               # just build dist/*.whl and *.tar.gz
+uv run tox -e integration        # opt-in; needs the REST catalog + MinIO up
+uv run tox -- -k pushdown        # arguments after `--` go to pytest
+```
+
+`tox` installs the built wheel and runs the suite against *that*, not against `src/`,
+so anything missing from the package fails here rather than after a release. The
+underlying tools are still available directly:
 
 ```bash
 uv run pytest                    # unit + local-fixture tests, no network

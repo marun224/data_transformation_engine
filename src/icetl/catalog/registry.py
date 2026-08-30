@@ -63,7 +63,7 @@ class CatalogRegistry:
             known = ", ".join(self.names())
             raise CatalogNotFoundError(
                 f"Catalog {resolved!r} is not configured. Known catalogs: {known}. "
-                f"Configure it with `spark.sql.catalog.{resolved}.uri=...`."
+                f"Configure it with `icetl.catalog.{resolved}.uri=...`."
             )
 
         catalog = self._build(resolved)

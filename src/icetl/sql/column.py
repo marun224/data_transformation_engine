@@ -2,7 +2,7 @@
 
 A Column is a thin wrapper: every operator builds a sqlglot expression and hands back
 a new Column. Nothing is evaluated, nothing is bound to a DataFrame, and the same
-node types come out as `spark.sql()` produces for the same operation (P1).
+node types come out as `Session.sql()` produces for the same operation (P1).
 
 Nodes are copied on the way in and out. sqlglot expressions carry parent pointers, so
 sharing one between two trees would corrupt both -- and `c = col("a"); c + 1; c * 2`
@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING, Any
 import sqlglot
 from sqlglot import exp
 
-from icetl.compat.naming import spark_output_name
-from icetl.errors import PySparkTypeError, PySparkValueError, UnsupportedFeatureError
+from icetl.compat import SQL_DIALECT
+from icetl.compat.naming import output_name
+from icetl.errors import EngineTypeError, EngineValueError, UnsupportedFeatureError
 from icetl.plan.builder import as_expression
 from icetl.types import DataType
 
@@ -46,7 +47,7 @@ def to_literal(value: Any) -> exp.Expression:
     if value is None:
         return exp.null()
     if isinstance(value, Column):
-        raise PySparkTypeError("A Column is already an expression; it cannot be made a literal.")
+        raise EngineTypeError("A Column is already an expression; it cannot be made a literal.")
     if isinstance(value, bool):
         # Checked before int: bool is an int subclass and `exp.convert` would emit 1/0.
         return exp.true() if value else exp.false()
@@ -54,7 +55,7 @@ def to_literal(value: Any) -> exp.Expression:
         return as_expression(exp.convert(value))
     if isinstance(value, (list, tuple)):
         return exp.Array(expressions=[to_literal(item) for item in value])
-    raise PySparkTypeError(
+    raise EngineTypeError(
         f"Cannot make a literal from {type(value).__name__}. Supported: "
         f"{', '.join(t.__name__ for t in _LITERAL_TYPES)}, None, and lists of those."
     )
@@ -63,7 +64,7 @@ def to_literal(value: Any) -> exp.Expression:
 def to_expression(value: Any) -> exp.Expression:
     """Coerce a Column, a column name, or a plain value into an expression node.
 
-    Note the asymmetry Spark has: in an *operator* position a bare string is a
+    Note the asymmetry the reference engine has: in an *operator* position a bare string is a
     literal (`col("a") == "b"` compares against the string `b`), while in a
     *projection* position it names a column. Callers pick; this function is the
     operator-position rule.
@@ -80,7 +81,7 @@ class Column:
 
     def __init__(self, expression: exp.Expression) -> None:
         if not isinstance(expression, exp.Expression):
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 f"Column expects a sqlglot expression, got {type(expression).__name__}. "
                 f"Build columns with F.col(), F.lit(), or F.expr()."
             )
@@ -99,8 +100,8 @@ class Column:
 
     @property
     def _output_name(self) -> str:
-        """The name Spark would give this column in a projection."""
-        return spark_output_name(self._expression)
+        """The name the reference engine would give this column in a projection."""
+        return output_name(self._expression)
 
     # -- comparison --------------------------------------------------------
 
@@ -149,7 +150,7 @@ class Column:
         return self._division(other, reverse=True)
 
     def __mod__(self, other: Any) -> Column:
-        # DuckDB already returns NULL for `x % 0`, matching Spark. No guard needed.
+        # DuckDB already returns NULL for `x % 0`, matching the reference engine. No guard needed.
         return self._binary(exp.Mod, other)
 
     def __rmod__(self, other: Any) -> Column:
@@ -159,10 +160,10 @@ class Column:
         return Column(exp.Neg(this=self._copy()))
 
     def _division(self, other: Any, *, reverse: bool = False) -> Column:
-        """Spark division: `x / 0` is NULL, not an error and not infinity.
+        """The reference engine division: `x / 0` is NULL, not an error and not infinity.
 
-        `safe=True` is how sqlglot spells that, and it is the same flag its Spark
-        parser sets, so `df` and `spark.sql` produce an identical node. Generating
+        `safe=True` is how sqlglot spells that, and it is the same flag its the reference engine
+        parser sets, so `df` and `Session.sql` produce an identical node. Generating
         for DuckDB turns it into `x / NULLIF(y, 0)`; without it DuckDB 1.5 would
         return `inf`, which is a wrong answer rather than a loud one.
 
@@ -195,7 +196,7 @@ class Column:
         return Column(exp.Not(this=exp.paren(self._copy())))
 
     def __bool__(self) -> bool:
-        raise PySparkValueError(
+        raise EngineValueError(
             "Cannot convert a Column into a bool. Use `&` for and, `|` for or, and "
             "`~` for not, and parenthesise each operand -- Python binds `&` tighter "
             "than `==`, so `df.a == 1 & df.b == 2` is not what it looks like."
@@ -210,13 +211,13 @@ class Column:
         return Column(exp.Not(this=exp.Is(this=self._copy(), expression=exp.null())))
 
     def isNaN(self) -> Column:
-        """True for a floating-point NaN. Distinct from NULL in both Spark and DuckDB."""
+        """True for a floating-point NaN. Distinct from NULL in both the reference and DuckDB."""
         return Column(exp.Anonymous(this="isnan", expressions=[self._copy()]))
 
     def eqNullSafe(self, other: Any) -> Column:
-        """Spark's `<=>`: equality where two NULLs compare equal.
+        """The reference engine's `<=>`: equality where two NULLs compare equal.
 
-        `IS NOT DISTINCT FROM` is the SQL spelling, and it is what sqlglot's Spark
+        `IS NOT DISTINCT FROM` is the SQL spelling, and it is what sqlglot's the reference engine
         parser produces for `<=>`, so both surfaces build the same node (P1).
         """
         return Column(exp.NullSafeEQ(this=self._copy(), expression=to_expression(other)))
@@ -226,23 +227,23 @@ class Column:
     def alias(self, *alias: str, **kwargs: Any) -> Column:
         """Rename the column. Multiple names are for exploding functions (Phase 6)."""
         if kwargs:
-            raise PySparkValueError(
+            raise EngineValueError(
                 f"alias() got unexpected keyword(s): {', '.join(sorted(kwargs))}."
             )
         if len(alias) != 1:
-            raise PySparkValueError(
+            raise EngineValueError(
                 f"alias() takes exactly one name in Phase 1, got {len(alias)}. "
                 f"Multiple aliases are for generator functions, which arrive in Phase 6."
             )
         return Column(as_expression(exp.alias_(self._copy(), alias[0], quoted=True)))
 
-    # Spark exposes both spellings; `name` is the older one.
+    # The reference engine exposes both spellings; `name` is the older one.
     name = alias
 
     def cast(self, dataType: DataType | str) -> Column:
-        """Cast to a Spark type, given as a `DataType` or a DDL string like `"int"`.
+        """Cast to a reference type, given as a `DataType` or a DDL string like `"int"`.
 
-        Uses SQL `CAST`, so an unparseable value raises where Spark's default
+        Uses SQL `CAST`, so an unparseable value raises where the reference engine's default
         (non-ANSI) mode would return NULL. Loud rather than wrong; `TRY_CAST` is
         Phase 3's conformance work. Recorded in divergence.md.
         """
@@ -251,13 +252,15 @@ class Column:
         elif isinstance(dataType, str):
             ddl = dataType
         else:
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 f"cast() expects a DataType or a DDL string, got {type(dataType).__name__}."
             )
         try:
-            target = exp.DataType.build(ddl, dialect="spark")
+            target = exp.DataType.build(ddl, dialect=SQL_DIALECT)
         except Exception as exc:
-            raise PySparkValueError(f"{ddl!r} is not a recognised Spark type.") from exc
+            raise EngineValueError(
+                f"{ddl!r} is not a recognised the reference engine type."
+            ) from exc
         return Column(exp.Cast(this=self._copy(), to=target))
 
     astype = cast
@@ -267,10 +270,10 @@ class Column:
     def _ordered(self, *, desc: bool, nulls_first: bool | None = None) -> Column:
         """One `ORDER BY` term.
 
-        When `nulls_first` is left unstated, `icetl.sql.conformance` fills in Spark's
+        When `nulls_first` is left unstated, `icetl.sql.conformance` fills in the reference engine's
         default at compile time -- nulls first ascending, last descending. Doing it
         there rather than here is what makes `df.orderBy(col("x"))` and
-        `spark.sql("... ORDER BY x")` agree, since only one of them comes through
+        `Session.sql("... ORDER BY x")` agree, since only one of them comes through
         this method.
         """
         node = exp.Ordered(this=self._copy(), desc=desc)
@@ -307,10 +310,10 @@ class Column:
         return Column(exp.ILike(this=self._copy(), expression=to_literal(other)))
 
     def rlike(self, other: str) -> Column:
-        """Java-regex match, as Spark's `rlike`.
+        """Java-regex match, as the reference engine's `rlike`.
 
         DuckDB's `regexp_matches` is a *search*, not an anchored match, which is the
-        same semantics Spark gives `rlike` -- both find the pattern anywhere in the
+        same semantics the reference engine gives `rlike` -- both find the pattern anywhere in the
         string unless it is anchored.
         """
         return Column(exp.RegexpLike(this=self._copy(), expression=to_literal(other)))
@@ -331,15 +334,13 @@ class Column:
         )
 
     def substr(self, startPos: int | Column, length: int | Column) -> Column:
-        """Spark's `substr`, which is **1-indexed**, as SQL `SUBSTRING` is.
+        """The reference engine's `substr`, which is **1-indexed**, as SQL `SUBSTRING` is.
 
         Both arguments may be Columns, which is why they go through `to_expression`
         rather than being inlined as literals.
         """
         if isinstance(startPos, Column) != isinstance(length, Column):
-            raise PySparkTypeError(
-                "substr() takes either two ints or two Columns, not one of each."
-            )
+            raise EngineTypeError("substr() takes either two ints or two Columns, not one of each.")
         return Column(
             exp.Substring(
                 this=self._copy(),
@@ -351,33 +352,33 @@ class Column:
     # -- element access ----------------------------------------------------
 
     def getItem(self, key: Any) -> Column:
-        """`col[i]` for an array (0-based, as Spark) or `col[k]` for a map."""
+        """`col[i]` for an array (0-based, as the reference engine) or `col[k]` for a map."""
         return self.__getitem__(key)
 
     def getField(self, name: str) -> Column:
         """`col.field` for a struct."""
         if not isinstance(name, str):
-            raise PySparkTypeError(f"getField() expects a name, got {type(name).__name__}.")
+            raise EngineTypeError(f"getField() expects a name, got {type(name).__name__}.")
         return Column(exp.Dot(this=self._copy(), expression=exp.to_identifier(name, quoted=True)))
 
     def __getitem__(self, key: Any) -> Column:
         """`col[0]`, `col["k"]`, and `col["field"]` for a struct.
 
-        Spark's arrays are 0-based while DuckDB's `list[i]` is 1-based, so an integer
+        The reference engine's arrays are 0-based while DuckDB's `list[i]` is 1-based, so an integer
         index is shifted. A string key is left alone: it addresses a map entry or a
         struct field, and neither is positional.
         """
         if isinstance(key, Column):
             return Column(exp.Bracket(this=self._copy(), expressions=[key._copy()]))
         if isinstance(key, bool):
-            raise PySparkTypeError("A bool is not a valid index or key.")
+            raise EngineTypeError("A bool is not a valid index or key.")
         if isinstance(key, int):
             return Column(
                 exp.Bracket(this=self._copy(), expressions=[to_literal(key + 1)], offset=1)
             )
         if isinstance(key, str):
             return Column(exp.Bracket(this=self._copy(), expressions=[to_literal(key)]))
-        raise PySparkTypeError(f"Cannot index a Column with {type(key).__name__}.")
+        raise EngineTypeError(f"Cannot index a Column with {type(key).__name__}.")
 
     def __getattr__(self, name: str) -> Column:
         """`col.field`, the attribute spelling of `getField`."""
@@ -401,11 +402,11 @@ class Column:
     def when(self, condition: Column, value: Any) -> Column:
         """Add a branch to a `CASE` started by `F.when`."""
         if not isinstance(self._expression, exp.Case):
-            raise PySparkTypeError("when() can only be chained onto a Column built by F.when().")
+            raise EngineTypeError("when() can only be chained onto a Column built by F.when().")
         if self._expression.args.get("default") is not None:
-            raise PySparkTypeError("when() cannot follow otherwise().")
+            raise EngineTypeError("when() cannot follow otherwise().")
         if not isinstance(condition, Column):
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 f"when() expects a Column condition, got {type(condition).__name__}."
             )
         case = self._copy()
@@ -415,13 +416,13 @@ class Column:
         return Column(case)
 
     def otherwise(self, value: Any) -> Column:
-        """The `ELSE` of a `CASE`. Without it an unmatched row is NULL, as in Spark."""
+        """The `ELSE` of a `CASE`. Without it an unmatched row is NULL, as in the reference."""
         if not isinstance(self._expression, exp.Case):
-            raise PySparkTypeError(
+            raise EngineTypeError(
                 "otherwise() can only be chained onto a Column built by F.when()."
             )
         if self._expression.args.get("default") is not None:
-            raise PySparkTypeError("otherwise() can only be given once.")
+            raise EngineTypeError("otherwise() can only be given once.")
         case = self._copy()
         case.set("default", to_expression(value))
         return Column(case)
@@ -436,7 +437,7 @@ class Column:
     def isin(self, *values: Any) -> Column:
         """True when the column matches any of `values`.
 
-        Accepts either varargs or a single iterable, as Spark does.
+        Accepts either varargs or a single iterable, as the reference engine does.
         """
         items: Iterable[Any]
         if len(values) == 1 and isinstance(values[0], (list, tuple, set, frozenset)):
@@ -458,20 +459,20 @@ class Column:
 
     def __repr__(self) -> str:
         # Quoting is stripped first: internally we quote every identifier so that a
-        # column named `order` still works, but PySpark reprs `df["order"]` as
+        # column named `order` still works, but the reference API reprs `df["order"]` as
         # `Column<'order'>`, not with backticks around it.
         rendered = self._expression.copy()
         for identifier in rendered.find_all(exp.Identifier):
             identifier.set("quoted", False)
-        return f"Column<'{rendered.sql(dialect='spark')}'>"
+        return f"Column<'{rendered.sql(dialect=SQL_DIALECT)}'>"
 
     def __hash__(self) -> int:
         # `__eq__` builds a predicate rather than comparing, so identity is the only
-        # hash that stays consistent. PySpark's Column behaves the same way.
+        # hash that stays consistent. the reference API's Column behaves the same way.
         return id(self)
 
     def __iter__(self) -> Any:
-        raise PySparkTypeError("A Column is not iterable.")
+        raise EngineTypeError("A Column is not iterable.")
 
 
 def _is_nonzero_literal(node: exp.Expression) -> bool:
@@ -491,5 +492,5 @@ def _column_from_name(name: str) -> Column:
     if name.endswith(".*"):
         qualifier = name[:-2]
         return Column(exp.Column(this=exp.Star(), table=exp.to_identifier(qualifier)))
-    parsed = sqlglot.maybe_parse(name, into=exp.Column, dialect="spark")
+    parsed = sqlglot.maybe_parse(name, into=exp.Column, dialect=SQL_DIALECT)
     return Column(parsed)
