@@ -112,7 +112,8 @@ semantics were the reason for the column. Addition and subtraction already agree
 | `first`/`last(ignorenulls=True)` | skips NULLs | no equivalent | refused rather than silently keeping them | ⚠️ |
 | `explode(arr)` | row per element, drops empty | — | `UNNEST` | 📋 Phase 6 |
 | `explode_outer(arr)` | keeps empty as NULL | — | `LEFT JOIN UNNEST` | 📋 Phase 6 |
-| `df.join(o, "k")` | one `k` column | two | rewrite to `USING` + explicit projection | 📋 Phase 4 |
+| `df.join(o, "k")` | one `k` column | two | the name form emits `USING (k)`, which collapses it; the Column form emits `ON` and keeps both | ✅ |
+| Duplicate column names after a join | two columns both named `id`; `df["id"]` is then ambiguous and raises | — | ours are disambiguated to `id` and `id_1`, so a later `select` resolves instead of raising | ⚠️ |
 | `rint(2.5)` | `2.0` (HALF_EVEN) | `round` gives `3` | pick the even neighbour on an exact tie, defer to `round` otherwise | ✅ |
 | `weekday` | Monday = 0 | `dayofweek` is Sunday = 0 | `(dayofweek + 6) % 7`, a *different* shift from `dayofweek`'s | ✅ |
 | `next_day(d, day)` | strictly after `d` | — | `(target - dow + 7) % 7`, mapping a zero delta to 7 | ✅ |
@@ -208,6 +209,33 @@ silent wrong answer if unhandled, which is why each has a fixture rather than a 
 | Unaliased projection names | sqlglot's `qualify` renames `sum(amount)` to `_col_0`. The optimized plan is adopted only if its output columns can be re-aliased to the names analysis already computed; otherwise the unoptimized plan runs instead | ✅ |
 | Identifier case in the optimizer | the optimizer runs in DuckDB's dialect, which is case-insensitive, so `VendorID` is normalised internally. Output names are restored from the analysed schema, so the user-visible spelling is unaffected | ✅ |
 | Nullability | the analysed schema comes from DuckDB, which has no non-nullable expression, so every field reports `nullable = true` even where Iceberg marked it required | ⚠️ |
+
+## Surface divergences — `Session.sql()` vs `F.*` ⚠️
+
+**P1 does not currently hold for function names** (decision 16, deferred to Phase 15).
+The conformance rules in `sql/conformance.py` are a tree pass both surfaces cross, so
+casting, division and null ordering agree. But a function whose reference behaviour is
+produced by *composition* in `sql/functions.py` exists only on the `F.*` path — a bare
+name in `Session.sql()` is handed to DuckDB unchanged.
+
+| Behaviour | `Session.sql()` | `F.*` | Reference | Status |
+|---|---|---|---|---|
+| `weekday(Monday)` | `1` | `0` | `0` | ⚠️ **silently different** |
+| `dayofweek(Monday)` | `1` | `2` | `2` | ⚠️ **silently different** |
+| `rint`, `log1p`, `expm1`, `find_in_set`, `octet_length`, `overlay`, `width_bucket`, `regexp_substr` | raises `AnalysisException` | correct | — | ⚠️ missing in SQL, but loud |
+| `size(NULL)` | `NULL` | `NULL` | `-1` | ⚠️ wrong on **both** — a plain conformance bug |
+
+`weekday` and `dayofweek` are the ones that can produce a wrong answer: both surfaces
+return a value, neither raises, and the SQL surface carries DuckDB's week numbering. An
+off-by-one weekday does not look like a defect in a result set. **Prefer `F.*` over
+`Session.sql()` for date-part work** until Phase 15 lands.
+
+The remaining eight raise, so they cannot silently mislead — they simply are not
+available through SQL yet.
+
+Measured over a 17-case sample of the 273-name surface, not the whole of it; the
+exhaustive both-surfaces test is Phase 15's deliverable. `notebooks/01_read_real_table.ipynb`
+section 8 runs the sample live.
 
 ## Environment-level divergences
 

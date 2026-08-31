@@ -36,6 +36,7 @@ from icetl.errors import (
 from icetl.exec.result import format_show, to_pandas, to_rows
 from icetl.plan.builder import as_expression, wrap_as_subquery
 from icetl.sql.column import Column
+from icetl.sql.group import GroupedData
 from icetl.types import Row, StructType
 
 if TYPE_CHECKING:
@@ -53,6 +54,24 @@ _DEFAULT_TRUNCATE = 20
 # Clauses whose presence means a new projection or filter cannot simply be merged
 # into the existing SELECT.
 _POST_FILTER_CLAUSES = ("group", "order", "limit", "offset", "distinct", "having", "qualify")
+
+#: The reference engine's `how` spellings -> (side, kind) on a sqlglot Join. Underscores
+#: are stripped before lookup, so `left_outer` and `leftouter` both land here.
+_JOIN_KINDS: dict[str, tuple[str | None, str | None]] = {
+    "inner": (None, None),
+    "cross": (None, "CROSS"),
+    "left": ("LEFT", None),
+    "leftouter": ("LEFT", "OUTER"),
+    "right": ("RIGHT", None),
+    "rightouter": ("RIGHT", "OUTER"),
+    "outer": ("FULL", "OUTER"),
+    "full": ("FULL", "OUTER"),
+    "fullouter": ("FULL", "OUTER"),
+    "semi": (None, "SEMI"),
+    "leftsemi": (None, "SEMI"),
+    "anti": (None, "ANTI"),
+    "leftanti": (None, "ANTI"),
+}
 
 
 class DataFrame:
@@ -86,9 +105,27 @@ class DataFrame:
             and not plan.args.get("laterals")
         )
 
+    def _projection_is_replaceable(self) -> bool:
+        """True when the projection list can be swapped without nesting.
+
+        Wider than `_is_star_projection` in one way: **joins are allowed**. Replacing
+        `SELECT *` with `SELECT x.a, y.b` over `FROM x JOIN y` leaves the FROM and its
+        aliases exactly where they were, so the new projection can still see them.
+        Nesting here would hide them -- which is what made `df.alias("x").join(...)
+        .select(col("x.a"))` fail with an unresolved `x`.
+        """
+        plan = self._plan
+        return (
+            isinstance(plan, exp.Select)
+            and _has_from_clause(plan)
+            and len(plan.expressions) == 1
+            and isinstance(plan.expressions[0], exp.Star)
+            and not plan.args.get("laterals")
+        )
+
     def _rebase_projection(self) -> exp.Select:
         """A SELECT whose projection list is safe to replace wholesale."""
-        if self._is_star_projection() and not self._has_any(_POST_FILTER_CLAUSES):
+        if self._projection_is_replaceable() and not self._has_any(_POST_FILTER_CLAUSES):
             return cast(exp.Select, self._plan.copy())
         return wrap_as_subquery(self._plan, self._session._next_alias())
 
@@ -305,6 +342,154 @@ class DataFrame:
             return self
         return self.select(*remaining)
 
+    # -- joins --------------------------------------------------------------
+
+    def join(
+        self,
+        other: DataFrame,
+        on: Column | str | list[str] | None = None,
+        how: str = "inner",
+    ) -> DataFrame:
+        """Join `other`, matching the reference engine's spellings of `how`.
+
+        `on` decides how the key columns appear in the output, and the two forms differ:
+
+            on="k"                  -> `USING (k)`, so **one** `k` column survives
+            on=col("a.k") == col("b.k")  -> `ON ...`, so **both** are kept
+
+        That is the reference behaviour, and the reason the string form is not just
+        sugar for the Column form -- `divergence.md` records it. A semi or anti join
+        emits the left side's columns only, whichever form is used.
+        """
+        if not isinstance(other, DataFrame):
+            raise EngineTypeError(f"join() expects a DataFrame, got {type(other).__name__}.")
+        if other._session is not self._session:
+            raise EngineValueError("join() cannot combine DataFrames from different sessions.")
+        if not isinstance(how, str):
+            raise EngineTypeError(f"join() expects `how` as a string, got {type(how).__name__}.")
+
+        normalised = how.strip().lower().replace("_", "")
+        if normalised not in _JOIN_KINDS:
+            raise EngineValueError(
+                f"Unknown join type {how!r}. Known: {', '.join(sorted(set(_JOIN_KINDS)))}."
+            )
+        side, kind = _JOIN_KINDS[normalised]
+
+        if on is None:
+            # The reference engine turns a keyless join into a cartesian product.
+            if normalised not in ("inner", "cross"):
+                raise EngineValueError(
+                    f"A {how!r} join needs an `on` condition; only inner and cross joins "
+                    f"may be keyless."
+                )
+            side, kind = None, "CROSS"
+
+        join_args: dict[str, Any] = {}
+        if on is not None:
+            keys = _join_keys(on)
+            if keys is not None:
+                join_args["using"] = [exp.column(key, quoted=True) for key in keys]
+            elif isinstance(on, Column):
+                join_args["on"] = on._expression.copy()
+            else:
+                raise EngineTypeError(
+                    f"join() takes `on` as a column name, a list of names, or a Column, "
+                    f"got {type(on).__name__}."
+                )
+
+        plan = self._as_join_base()
+        relation = other._as_join_relation()
+        plan.set(
+            "joins",
+            [
+                *(plan.args.get("joins") or []),
+                exp.Join(this=relation, side=side, kind=kind, **join_args),
+            ],
+        )
+        return DataFrame(self._session, plan, {**self._sources, **other._sources})
+
+    def crossJoin(self, other: DataFrame) -> DataFrame:
+        """Every row of this frame paired with every row of `other`."""
+        return self.join(other, on=None, how="cross")
+
+    def _as_join_base(self) -> exp.Select:
+        """This plan as a SELECT a join can be appended to, keeping any alias it has."""
+        if self._is_joinable_select():
+            return cast(exp.Select, self._plan.copy())
+        return wrap_as_subquery(self._plan, self._session._next_alias())
+
+    def _as_join_relation(self) -> exp.Expression:
+        """This plan as the right-hand relation of a join.
+
+        A frame that is exactly `SELECT * FROM (x) AS a` -- which is what `alias()`
+        produces -- contributes `(x) AS a`, so `a.column` still resolves on the other
+        side of the join. Anything else is nested under a generated alias.
+        """
+        if self._is_joinable_select():
+            from_clause = _from_clause(cast(exp.Select, self._plan))
+            if from_clause is not None:
+                return as_expression(from_clause.this.copy())
+        return exp.Subquery(
+            this=self._plan.copy(),
+            alias=exp.TableAlias(this=exp.to_identifier(self._session._next_alias())),
+        )
+
+    def _is_joinable_select(self) -> bool:
+        """True when this plan is a bare `SELECT * FROM <one relation>`.
+
+        Everything else -- a projection, a filter, an existing join -- has to be nested,
+        because a join would otherwise change what those clauses see.
+        """
+        plan = self._plan
+        return (
+            isinstance(plan, exp.Select)
+            and _has_from_clause(plan)
+            and len(plan.expressions) == 1
+            and isinstance(plan.expressions[0], exp.Star)
+            and not plan.args.get("joins")
+            and not plan.args.get("laterals")
+            and not plan.args.get("where")
+            and not self._has_any(_POST_FILTER_CLAUSES)
+        )
+
+    # -- grouping ----------------------------------------------------------
+
+    def groupBy(self, *cols: Any) -> GroupedData:
+        """Group by the given columns or expressions.
+
+        Returns a `GroupedData`, which builds no plan until `agg()` is called -- so
+        `groupBy` alone runs nothing and resolves no schema (P3).
+        """
+        items = _flatten(cols)
+        grouping: list[exp.Expression] = []
+        names: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                column = self._column_ref(item)
+            elif isinstance(item, Column):
+                column = item
+            else:
+                raise EngineTypeError(
+                    f"groupBy() takes column names or Column objects, got {type(item).__name__}."
+                )
+            expression = column._expression.copy()
+            # An alias groups by the *expression* but is named by the alias, so the
+            # GROUP BY clause must carry the underlying node, not the `AS` wrapper.
+            if isinstance(expression, exp.Alias):
+                names.append(expression.alias)
+                expression = as_expression(expression.this)
+            else:
+                names.append(column._output_name)
+            grouping.append(expression)
+        return GroupedData(self, grouping, names)
+
+    #: The reference engine exposes both spellings.
+    groupby = groupBy
+
+    def agg(self, *exprs: Any, **kwargs: Any) -> DataFrame:
+        """Aggregate the whole frame, as `groupBy()` with no keys does."""
+        return GroupedData(self, [], []).agg(*exprs, **kwargs)
+
     def alias(self, alias: str) -> DataFrame:
         """Name this DataFrame, so its columns can be qualified as `alias.column`."""
         if not isinstance(alias, str):
@@ -464,6 +649,19 @@ class DataFrame:
         return f"DataFrame[{', '.join(f'{n}: {t}' for n, t in self.dtypes)}]"
 
 
+def _from_clause(plan: exp.Select) -> exp.From | None:
+    """The SELECT's own FROM node, or None.
+
+    Scans direct arguments for the same reason `_has_from_clause` does: sqlglot v30
+    spells the key `from_`, earlier releases `from`, and `plan.find()` would reach into
+    a subquery.
+    """
+    for value in plan.args.values():
+        if isinstance(value, exp.From):
+            return value
+    return None
+
+
 def _has_from_clause(plan: exp.Select) -> bool:
     """True when the SELECT has its own FROM.
 
@@ -479,6 +677,15 @@ def _flatten(items: Any) -> list[Any]:
     if len(items) == 1 and isinstance(items[0], (list, tuple)):
         return list(items[0])
     return list(items)
+
+
+def _join_keys(on: Column | str | list[str]) -> list[str] | None:
+    """The `USING` column names in `on`, or None when `on` is a Column condition."""
+    if isinstance(on, str):
+        return [on]
+    if isinstance(on, (list, tuple)) and on and all(isinstance(item, str) for item in on):
+        return list(on)
+    return None
 
 
 def _to_predicate(condition: Column | str) -> exp.Expression:

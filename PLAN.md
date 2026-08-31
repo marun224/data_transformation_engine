@@ -377,11 +377,17 @@ retrofitted:
 Each phase ends with green tests and something you can run. Phases 0–3 are the
 critical path; after that, breadth phases can be reordered or parallelised.
 
-**Phases 12–14 are deferred**, not optional-forever. 12–13 hold the merge-on-read
-work decision 11 took out of Phase 2; 14 holds the decimal promotion decision 14 took
-out of Phase 3. Nothing in scope needs them today. Where a cheap guard exists it is in
-place — the scan planner refuses a merge-on-read table rather than guessing — and
-where one does not, Phase 14, the divergence is written down instead.
+**Phases 12–15 are deferred**, not optional-forever. 12–13 hold the merge-on-read
+work decision 11 took out of Phase 2; 14 holds the decimal promotion and 15 the
+SQL-surface function resolution that decisions 14 and 16 took out of Phase 3. Nothing
+in scope needs them today. Where a cheap guard exists it is in place — the scan planner
+refuses a merge-on-read table rather than guessing — and where one does not (14 and 15,
+where detecting the problem costs as much as fixing it), the divergence is written down
+instead.
+
+Phase 15 is the one with a **live wrong-answer path**: `weekday` and `dayofweek` are off
+by one through `Session.sql()`, silently. Prefer `F.*` for date-part work until it
+lands.
 
 ### Phase 0 — Scaffolding *(small)*
 - `uv` project, `.venv` on Python 3.12, `pyproject.toml` with all deps + `ipykernel`.
@@ -585,6 +591,51 @@ scale with a smaller precision, which overflows only at extreme magnitudes. `/`
 returns `DOUBLE` — accurate to ~15 significant digits, so wrong only where exact
 decimal semantics were the point. That is the case to watch.
 
+### Phase 15 — Function resolution on the SQL surface *(deferred from Phase 3 by decision 16)*
+
+P1 says the two surfaces converge on one tree. That holds for *relational* structure and
+for the conformance rules in `sql/conformance.py`, which are a tree pass both surfaces
+cross. It does **not** hold for functions whose reference behaviour is produced by
+**composition inside `sql/functions.py`**: `rint` picking the even neighbour on a tie,
+`weekday` shifting Monday to 0, `overlay` built out of `substring`. Those compositions
+exist only on the `F.*` path. A bare name in `Session.sql()` goes straight to DuckDB.
+
+Measured over a 17-case sample of the 273-name surface:
+
+| Class | Count | Example | Danger |
+|---|---|---|---|
+| **Silently different** | 2 | `weekday(Monday)` → `1` in SQL, `0` via `F.*` | **wrong answers, nothing raises** |
+| Missing on the SQL surface | 9 | `rint`, `log1p`, `expm1`, `find_in_set`, `octet_length`, `overlay`, `width_bucket`, `regexp_substr` | raises `AnalysisException` — loud, safe |
+| Agree but both wrong | 1 | `size(NULL)` → `NULL`, reference says `-1` | a plain conformance bug, unrelated to the split |
+
+**The work:**
+
+- Resolve function names in the SQL path through the same `F.*` table the DataFrame API
+  uses, so `Session.sql("SELECT rint(2.5)")` reaches `functions.rint` rather than
+  DuckDB's `rint`. The hook belongs where the parsed tree is first walked, before the
+  optimizer, so pushdown sees what executes.
+- Leave names that are *already* correct in DuckDB alone — most of the 273 are
+  pass-throughs, and routing them through Python would cost without buying anything.
+- Fix `size(NULL)` to answer `-1`. `array_size`'s docstring already states the two must
+  differ; `size` is implemented as `sg.ArraySize`, which makes them aliases.
+- **The durable part: a test over the whole surface**, asserting that every name in
+  `F.__all__` gives the same value through both surfaces or is absent from both. The
+  sample above found the gap; only an exhaustive check stops it reopening.
+
+**Done when:** no name in `F.__all__` answers differently through `Session.sql()` than
+through `F.*`.
+
+**Why it was not done in Phase 3.** Phase 3's tests exercise the `F.*` surface, which is
+where the compositions live, so nothing in the suite could see the gap — 821 tests pass
+with it present. It was found by running the notebook in section 8 of
+`notebooks/01_read_real_table.ipynb`, not by the suite.
+
+**Interim exposure:** `weekday` and `dayofweek` are the ones to watch. Both surfaces
+answer, neither raises, and the SQL surface is off by one because DuckDB numbers the week
+differently. An off-by-one weekday is invisible in a result set. The other nine raise, so
+they cannot produce a wrong answer. Prefer `F.*` over `Session.sql()` for date-part work
+until this lands.
+
 ---
 
 ## 5. Testing strategy
@@ -633,6 +684,7 @@ decimal semantics were the point. That is the case to watch.
 | 13 | **No PySpark, ever — not even to generate test fixtures** (2026-08-30). Supersedes carry-over note 9, which wanted a golden corpus generated from real Spark in a throwaway venv. Conformance cases are instead written from Spark's published behaviour, each carrying a citation. **What this costs:** an edge case where Spark's real behaviour differs from its documentation will produce a confidently green test. Undocumented corners — NULL propagation, empty input, overflow, decimal promotion — are the exposure. `compat/divergence.md` marks conformance as *asserted, not machine-verified* so the limit is visible rather than implied. |
 | 12 | **Build the function library; use SQLFrame as a reference, not a dependency** (2026-08-30). Settles decision 8. Neither SQLFrame nor `duckdb.experimental.spark` implements Spark conformance — both return `inf` for `1/0`, both raise on `CAST('abc' AS INT)`, neither emits explicit NULLS FIRST/LAST — so §3.5 is ours either way, and neither can read Iceberg through our planner. SQLFrame also pins `sqlglot<30.13` against our 30.17. Its 478 function→sqlglot-node mappings are read as a lookup table (MIT); nothing is imported. |
 | 15 | **The PySpark compatibility surface is dropped** (2026-08-30). Supersedes decisions 1 and 8. icetl is an Iceberg + DuckDB library and no longer presents itself as Spark: `SparkSession` → `Session`, `PySpark*Error` → `Engine*Error`, the shadow `src/pyspark` package is deleted, `spark.*` config keys are replaced by `icetl.*` twins, and `F.spark_partition_id` is removed (273 names). **What stays, deliberately:** Spark 3.5 remains the *semantic* reference (P5) under the neutral name *the reference*, because having a written spec beats deciding each edge case ad hoc; and sqlglot's `"spark"` dialect stays, bound to `SQL_DIALECT`, because it names a SQL *grammar* — changing it would change the language accepted, not the branding. **What this costs:** any script doing `from pyspark.sql import SparkSession`, catching `PySparkTypeError`, or passing `spark.*` keys to `.config()` breaks. That is the intent, and no test covered the shadow package, so nothing in the suite regressed. |
+| 16 | **SQL-surface function resolution deferred to Phase 15** (2026-08-30). Functions whose reference behaviour comes from composition in `sql/functions.py` are reachable only through `F.*`; a bare name in `Session.sql()` goes to DuckDB. Of a 17-case sample: 2 answer **silently differently** (`weekday`, `dayofweek` — off by one), 9 raise because DuckDB has no such function, 1 (`size(NULL)`) is wrong on both. **Deferred, not dropped** — the fix is a resolution hook plus an exhaustive both-surfaces test, and it is worth doing as its own piece rather than inside Phase 4. **No guard**, unlike decision 11: detecting the divergence means evaluating both surfaces, which is the test, which is the fix. `compat/divergence.md` is the warning instead. **What this costs:** P1 is stated over both surfaces and does not currently hold for these names. |
 | 11 | **Copy-on-write for now; merge-on-read deferred** (2026-08-30). Every writer of the tables in scope rewrites data files, so no delete or position files exist and §3.3's hybrid split is not built. **Deferred, not dropped** — MoR *reading* is Phase 12, MoR *writing* is Phase 13. The assumption is asserted at scan time rather than trusted, because `read_parquet` cannot see a delete file and would return deleted rows reporting success. Phase 8 writes COW, which is what PyIceberg does natively. |
 
 ### Still open

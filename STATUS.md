@@ -7,26 +7,29 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-08-30, after the Phase 3 work and the decision-15 rename.
+**Paused:** 2026-08-30, part-way through Phase 4 — aggregation and joins are in,
+set operations are next.
 
 ### Where things stand
 
 | | |
 |---|---|
 | Phases 0, 1, 2, 3 | **done**, green |
-| Phase 4 | **next** — relational breadth: joins, `groupBy().agg()`, set ops |
-| Phases 12, 13, 14 | **deferred by decision**, each with its own section in PLAN.md §4 |
+| Phase 4 | **in progress** — `groupBy().agg()` ✅ and joins ✅ done; set ops, `distinct`, `orderBy`, `na.*`/`stat.*`, temp views still to do |
+| Phases 12, 13, 14, 15 | **deferred by decision**, each with its own section in PLAN.md §4 |
+| ⚠️ Live gap | `weekday`/`dayofweek` are off by one through `Session.sql()` — **use `F.*` for date parts** until Phase 15 |
 | Decision 15 | **done** — the PySpark compat surface is removed; see the section below |
-| Tests | 821 local, 11 integration |
+| Tests | 882 local, 11 integration |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
 
 ### Committed
 
-Phases 0 through 2 are committed as `92efdb8` — *"Initial commit: icetl through
-Phase 3 (in progress)"*, 85 files, 16,408 lines.
+| Commit | What |
+|---|---|
+| `92efdb8` | *"Initial commit: icetl through Phase 3 (in progress)"* — 85 files, 16,408 lines |
+| `26c792d` | *"code refactoring"* — 66 files, +5,649/−1,460. Phase 3's completion (the third `F.*` tranche, the optimizer's `ArithmeticError` fix), decision 15's rename, `tox.ini`, and the notebooks |
 
-⚠️ **Phase 3's completion is not committed.** The third `F.*` tranche, the optimizer's
-`ArithmeticError` fix and these notes are in the working tree only.
+The working tree is clean as of this note.
 
 ### Picking it back up
 
@@ -36,8 +39,8 @@ gitignored; `.env.example` documents every key. Local tests need neither.
 
 ```bash
 uv sync --extra dev            # if the venv is cold
-uv run tox                     # the whole gate: lint, mypy, 821 tests, then dist/
-uv run pytest -q               # 821 expected, if you want just the tests
+uv run tox                     # the whole gate: lint, mypy, 882 tests, then dist/
+uv run pytest -q               # 882 expected, if you want just the tests
 uv run pytest -m integration -q # 11 expected; needs the catalog up
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 uv run python scripts/smoke_catalog.py -v   # proof of life against the real catalog
@@ -45,9 +48,20 @@ uv run python scripts/smoke_catalog.py -v   # proof of life against the real cat
 
 ### The next thing to do
 
-**Phase 3 is done. Open Phase 4 — relational breadth.** Joins, `groupBy().agg()`, set
-operations, `na.*` and `stat.*`; PLAN.md §4 has the list, and carry-over notes 10 and
-11 are both Phase 4's to pick up.
+**Phase 4 is under way.** `groupBy().agg()` and joins are done and green — see the
+Phase 4 section below for what each covers. **Next: set operations** (`union`,
+`unionByName`, `intersect`, `exceptAll`, `subtract`), where carry-over note 10 is waiting:
+the optimizer declines to rewrite a `UNION` whose output names need restoring, so set
+operations currently get no pushdown at all.
+
+After that: `distinct`/`dropDuplicates`, `orderBy`/`sort`, `rollup`/`cube`/`pivot`,
+`na.*` and `stat.*`, and the SQL side (CTEs, `EXISTS`, temp views). PLAN.md §4 has the
+full list.
+
+The SQL-surface function gap found at the end of Phase 3 is **deferred to Phase 15**
+(decision 16) — it is documented, not forgotten. One thing to carry while working:
+`weekday`/`dayofweek` answer differently through `Session.sql()` than through `F.*`, so
+reach for `F.*` on date parts.
 
 The `F.*` surface finished at 273 names, each with a value-level test. What is missing
 from it belongs to later phases by design, not by omission:
@@ -460,6 +474,142 @@ deletion regressed nothing — and nothing ever proved the zero-edit promise wor
 
 ---
 
+## Phase 4 — Relational breadth · **IN PROGRESS** (2026-08-30)
+
+Green on: `uv run tox` (lint · mypy · 882 tests against the built wheel · dist) and
+`uv run pytest -m integration` (11 passed).
+
+Two of Phase 4's pieces are done. Test count went 821 → 882.
+
+### `groupBy().agg()` — done
+
+**Built:** `sql/group.py` (`GroupedData`) and `DataFrame.groupBy` / `groupby` / `agg`.
+
+`GroupedData` holds no plan of its own — it is the frame plus the grouping expressions,
+and only `agg()` builds anything, so `groupBy` alone stays lazy (P3). Output is
+**grouping keys first, then aggregates**, which is what a script indexing `row[0]`
+depends on.
+
+| Form | Example |
+|---|---|
+| expressions | `gd.agg(F.sum("amount").alias("total"))` |
+| dict | `gd.agg({"amount": "sum"})` |
+| keywords | `gd.agg(total=F.sum("amount"))` |
+| shortcuts | `gd.count()`, `gd.sum("a")`, `gd.avg/mean/min/max("a")` |
+| whole frame | `df.agg(...)`, same as `df.groupBy().agg(...)` |
+
+**What the 29 tests pin.** `fx.plain` was chosen for its nulls (`vendor` is
+`a, b, a, c, NULL`, `amount` is `10.0, 20.5, 30.25, NULL, 50.0`), because that is where
+aggregation goes quietly wrong:
+
+- NULL is **its own grouping key** — 4 groups from 5 rows;
+- an **all-NULL group sums to NULL, not 0** (vendor `c`);
+- `count(*)` counts a row that `count(col)` skips — `("c", 1, 0)`;
+- `.count()` names its column `count`, not `count(1)`;
+- filtering *after* a group nests the plan, so the predicate hits groups not rows;
+- P1: the same query through `Session.sql()` gives the same answer.
+
+Two refusals rather than guesses: `agg("amount")` raises pointing at `F.sum("amount")`
+(a bare string is a column, not an aggregate), and `gd.sum()` with no columns raises
+naming Phase 4 — the reference aggregates every numeric column there, which needs the
+frame's types.
+
+**Pushdown survives grouping**: the headline aggregate on `nyc.yellow_tripdata` still
+reads 3 of 62 files and 3 of 19 columns.
+
+### Joins — done
+
+**Built:** `DataFrame.join` / `crossJoin`, plus `_JOIN_KINDS` mapping every spelling of
+`how` the reference accepts (`left`, `leftouter`, `left_outer`, `leftsemi`, …).
+
+`inner` · `left` · `right` · `outer`/`full` · `semi` · `anti` · `cross`, with `on` as a
+name, a list of names, or a Column. Self-joins work through `.alias()`.
+
+**The two `on` forms differ deliberately**, and this closes a divergence that had been
+open since Phase 3:
+
+| `on` | SQL emitted | Key columns out |
+|---|---|---|
+| `"id"` or `["id"]` | `USING (id)` | **one** |
+| `col("a.id") == col("b.id")` | `ON a.id = b.id` | **two** |
+
+Verified against DuckDB before building: `USING` collapses the key, `SEMI`/`ANTI` are
+supported natively, and semi/anti emit the left side's columns only.
+
+**A new divergence, recorded:** where a join yields two same-named columns, the reference
+keeps both called `id` and *raises* on a later `df["id"]` as ambiguous. Ours names them
+`id` and `id_1`, so the select resolves. Different, arguably kinder, written down.
+
+### Two defects found while building
+
+- **Projecting through self-join aliases failed.** `df.alias("x").join(df.alias("y"), …)
+  .select(col("x.vendor"))` raised *"Referenced table x not found"*: the projection logic
+  nested any joined plan into a subquery, which hid the aliases. Replacing a projection
+  over a join is safe — the FROM and its aliases stay put — so `_rebase_projection` now
+  allows it via `_projection_is_replaceable`. `filter`'s extend-vs-nest rule is untouched;
+  changing it needs its own tests.
+- **`args["from"]` is `args["from_"]` in sqlglot 30.** My first `_as_join_relation` read
+  the old key, silently got `None`, and wrapped the right side in a generated alias — so
+  `b.id` stopped resolving. `_has_from_clause` already documented this exact trap; there
+  is now a `_from_clause` companion beside it so the next reader finds the accessor
+  rather than the key.
+
+### Still to do in Phase 4
+
+Set operations (`union`, `unionByName` incl. `allowMissingColumns`, `intersect`,
+`exceptAll`, `subtract`) — **next**, and carry-over note 10 lives here ·
+`distinct`/`dropDuplicates` · `orderBy`/`sort` · `sample`/`randomSplit` ·
+`repartition` (no-op) · `cache`/`persist` → DuckDB temp table · `rollup`/`cube`/`pivot` ·
+`na.fill/drop/replace` · `stat.*` (`approxQuantile`, `corr`, `cov`, `crosstab`,
+`freqItems`) · SQL side: CTEs, subqueries, `EXISTS`, temp views · and the `F.*`
+leftovers `grouping`, `grouping_id`, `broadcast`.
+
+Carry-over note 11 (two references to one table merging into a single scan) is visible in
+the generated join SQL — both sides of a self-join read the same
+`$icetl_src_0_paths_0`. Correct, but a self-join with disjoint filters prunes less than
+it could.
+
+---
+
+## Decision 16 — SQL-surface function resolution deferred to Phase 15 (2026-08-30)
+
+**P1 holds for the plan, not yet for the function library.** Relational structure and the
+conformance rules in `sql/conformance.py` are shared — that pass is a tree walk both
+surfaces cross. But a function whose reference behaviour comes from *composition* in
+`sql/functions.py` (`rint` picking the even neighbour on a tie, `weekday` shifting Monday
+to 0, `overlay` built from `substring`) exists only on the `F.*` path. `Session.sql()`
+hands the bare name to DuckDB.
+
+Measured over a 17-case sample of the 273-name surface, re-verified after the decision-15
+rename:
+
+| Class | Count | Names | Danger |
+|---|---|---|---|
+| **Silently different** | 2 | `weekday`, `dayofweek` — off by one | **wrong answers, nothing raises** |
+| Missing in SQL | 9 | `rint` (×2 cases), `log1p`, `expm1`, `find_in_set`, `octet_length`, `overlay`, `width_bucket`, `regexp_substr` | raises — loud, safe |
+| Agree, both wrong | 1 | `size(NULL)` → `NULL`, reference says `-1` | a plain conformance bug |
+| Agree | 5 | `array_size`, `split_part`, `next_day`, `element_at`, `equal_null` | — |
+
+**Why the suite did not catch it.** Phase 3's tests exercise the `F.*` surface, which is
+where the compositions live. 821 tests pass with the gap present. It was found by running
+`notebooks/01_read_real_table.ipynb` section 8, which probes both surfaces side by side.
+
+**No guard, unlike decision 11.** Detecting the divergence means evaluating a name on both
+surfaces and comparing — which is the test, which is the fix. There is nothing cheaper to
+assert, so `compat/divergence.md` carries the warning instead.
+
+**Interim exposure:** `weekday` and `dayofweek` only. Both surfaces answer, neither raises,
+and the SQL surface carries DuckDB's week numbering — an off-by-one weekday is invisible in
+a result set. **Prefer `F.*` over `Session.sql()` for date-part work.** The other nine
+raise, so they cannot mislead.
+
+**Phase 15 holds the work:** route SQL function names through the `F.*` table before the
+optimizer, fix `size(NULL)`, and — the durable part — assert over all of `F.__all__` that
+both surfaces agree or neither resolves. The sample found the gap; only an exhaustive test
+keeps it closed.
+
+---
+
 ## Carry-over notes
 
 Things found during earlier phases that later phases need.
@@ -472,6 +622,10 @@ Things found during earlier phases that later phases need.
 | ~~9~~ | ~~Golden conformance files generated from real PySpark~~ — **closed by decision 13**: no PySpark at any stage. Cases are written from Spark's published behaviour with a citation each. | — |
 | 10 | The optimizer declines to rewrite a `UNION` whose output names need restoring, so set operations get no pushdown. Fixable by re-aliasing the first branch. | Phase 4 |
 | 11 | Two references to one table merge to a single scan (union of columns, OR of predicates). Correct, but a self-join with disjoint filters prunes less than it could. | Phase 4 |
+| 13 | Functions built by *composition* in `sql/functions.py` are reachable only through `F.*`; `Session.sql()` hands the bare name to DuckDB. `weekday`/`dayofweek` answer **silently differently**; 8 more raise. Deferred by decision 16. | **Phase 15** |
+| 14 | `size(NULL)` gives `NULL` on both surfaces; the reference says `-1`. `array_size`'s own docstring says the two must differ, but `size` is `sg.ArraySize`, which makes them aliases. | **Phase 15** |
+| 15 | `explain()`'s `bytes_scanned` is the *selected files'* size, not bytes read — it ignores column pruning, so a narrow query looks far more expensive than it is. | Phase 10 |
+| 16 | An unfiltered `count(*)` reads parquet footers when Iceberg's manifests already hold the row count (~2× on a 357-file table, and it grows with file count). | Phase 10 |
 
 ---
 
