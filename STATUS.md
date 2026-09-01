@@ -7,18 +7,18 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-09-01, at the end of Phase 8. Phase 9 (schema, DDL, snapshots) is next
+**Paused:** 2026-09-01, at the end of Phase 9. Phase 10 (performance & scale) is next
 and is not started.
 
 ### Where things stand
 
 | | |
 |---|---|
-| Phases 0–8 | **done**, green |
+| Phases 0–9 | **done**, green |
 | Phases 12, 13, 14, 15 | **deferred by decision**, each with its own section in PLAN.md §4 |
 | ⚠️ Live gap | `weekday`/`dayofweek` are off by one through `Session.sql()` — **use `F.*` for date parts** until Phase 15 |
 | Decision 15 | **done** — the PySpark compat surface is removed; see the section below |
-| Tests | 1302 local, 11 integration |
+| Tests | 1426 local, 11 integration |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
 
 ### Committed
@@ -28,11 +28,12 @@ and is not started.
 | `92efdb8` | *"Initial commit: icetl through Phase 3 (in progress)"* — 85 files, 16,408 lines |
 | `26c792d` | *"code refactoring"* — 66 files, +5,649/−1,460. Phase 3's completion (the third `F.*` tranche, the optimizer's `ArithmeticError` fix), decision 15's rename, `tox.ini`, and the notebooks |
 | `dcb2739` | *"phase 4 chnages are committed"* — `groupBy().agg()` and joins |
+| `8c5b945` | *"Phase 8 changes"* — 32 files, +9,630/−118. The rest of Phase 4 and the whole of Phases 5, 6, 7 and 8, plus `FINDINGS.md` |
 
-> ⚠️ **Nothing after `dcb2739` is committed.** The rest of Phase 4 and the whole of
-> Phases 5, 6, 7 and 8 exist only in the working tree — Phases 4–7 staged in the index,
-> Phase 8 on top of them and not yet added. That is four phases of work in one place.
-> `git status` first; committing it is the first thing to do.
+> ⚠️ **Phase 9 is staged, not committed.** Everything through Phase 8 is in `8c5b945`.
+> Phase 9 is in the index — 17 files, 4 of them new — with nothing untracked, so
+> `git clean` is safe, but the work exists in exactly one place. `git status` first;
+> committing it is the first thing to do.
 
 ### Picking it back up
 
@@ -42,8 +43,8 @@ gitignored; `.env.example` documents every key. Local tests need neither.
 
 ```bash
 uv sync --extra dev            # if the venv is cold
-uv run tox                     # the whole gate: lint, mypy, 1302 tests, then dist/
-uv run pytest -q               # 1302 expected, if you want just the tests
+uv run tox                     # the whole gate: lint, mypy, 1426 tests, then dist/
+uv run pytest -q               # 1426 expected, if you want just the tests
 uv run pytest -m integration -q # 11 expected; needs the catalog up
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 uv run python scripts/smoke_catalog.py -v   # proof of life against the real catalog
@@ -51,28 +52,34 @@ uv run python scripts/smoke_catalog.py -v   # proof of life against the real cat
 
 ### The next thing to do
 
-**Phases 4 through 8 are complete.** The read side is finished, data can be written
-back, and rows can be changed in place: `df.write`, `insertInto`, SQL `INSERT`, and now
-`DELETE`, `UPDATE` and `MERGE` — the full Spark merge grammar — all copy-on-write.
+**Phases 4 through 9 are complete.** The read side, writing back, changing rows in place,
+and now the catalog itself: `session.catalog.*`, `CREATE`/`ALTER`/`DROP TABLE` and
+namespaces, partition-spec and sort-order evolution, `mergeSchema`, time travel, and
+Iceberg's metadata tables.
 
-**Next: Phase 9 — schema, DDL, snapshots.** `spark.catalog.*`, `CREATE`/`ALTER`/`DROP
-TABLE`, partition-spec and sort-order evolution, `mergeSchema` on write, time travel and
-the metadata tables. `Session.sql()` still raises `phase="Phase 9"` for `CREATE`, `DROP`
-and `ALTER`, which is the list of what to implement.
+**Next: Phase 10 — performance & scale.** DuckDB `memory_limit` and spill sized from
+available RAM, threads from physical cores, a wide-table benchmark harness against the
+200-column fixture and then the real table, result streaming so a large result never
+OOMs, a query cache, and benchmarks committed as a tracked file so regressions are
+visible.
 
-Three things from Phase 8 to carry into it:
+Four things from Phase 9 to carry into it, three of them already measured:
 
-- **Nested-field assignment is waiting on Phase 9.** `UPDATE t SET s.field = v` is
-  refused today. Phase 6 built the schema-aware `withField` machinery for the DataFrame
-  surface; making it reachable from SQL is the same job as `ALTER TABLE ... ALTER
-  COLUMN`, so do them together.
-- **Two languages, one set of nodes.** `plan/pushdown.scope_predicate` returns the
-  PyIceberg predicate *and* the sqlglot conjuncts it came from, so a caller needing both
-  cannot let them drift. Anything in Phase 9 that deletes by predicate wants that, not a
-  second translation.
-- **`_invalidate_source` still.** Any operation that changes a table must call it.
-  Schema changes need it too, and harder — a cached `ScanSource` pins the *schema id* as
-  well as the snapshot.
+- **`explain()`'s `bytes_scanned` ignores column pruning** (FINDINGS §3.3) and an
+  **unfiltered `count(*)` opens parquet footers** Iceberg's manifests could answer
+  (§3.4). Both are Phase 10's, and both are already written down with numbers.
+- **An inner join's `WHERE` conjunct is folded into the `ON` clause and stops pruning**
+  (§3.5, found in Phase 9). `extract_scan_requests` reads only the scope's `WHERE`;
+  reading the `ON` clause too is the fix, and `TestOuterJoinsAreNotPrunedByTheirOwnNullChecks`
+  already pins the measurement so a change is visible.
+- **Pruning is safe except under an outer join** (§1.10). Whatever Phase 10 adds to
+  pushdown has to pass through `is_null_rejecting` for a null-padded table, or it
+  reintroduces the anti-join bug in a new place.
+
+Still open from Phase 9 itself: `ALTER COLUMN ... TYPE` is refused because PyIceberg 0.11
+exposes no type update, and nested-field assignment (`UPDATE t SET s.field = v`) is still
+refused — it wants the schema-aware `withField` machinery on the SQL surface, which
+neither Phase 8 nor Phase 9 needed to build.
 
 PLAN.md §4 has the full phase list, and [FINDINGS.md](FINDINGS.md) has every trap found so
 far — worth ten minutes before writing anything that generates SQL.
@@ -1187,6 +1194,136 @@ by asking the table whether the first part is one of its columns.
   it read.
 - Merge-on-read is still Phase 13, and nothing here got closer to it — but nothing here
   got in its way either: the delete-file path would replace the commit, not the planning.
+
+---
+
+## Phase 9 — Schema, DDL, snapshots · **DONE** (2026-09-01)
+
+Green on: `uv run tox` (lint · mypy · **1426 tests against the built wheel** · dist) and
+`uv run pytest -m integration` (11 passed, against the real REST catalog + MinIO).
+Test count went 1302 → 1426.
+
+**Built:** `sql/catalog.py` (`session.catalog`), `sql/ddl.py` (`CREATE` / `DROP` /
+`ALTER`), `sql/reader.py` (`session.read`), time travel through the source key, Iceberg's
+metadata tables, and `mergeSchema` on write. 119 tests across
+`tests/fixture/test_catalog_api.py`, `test_ddl.py` and `test_time_travel.py`, plus five
+more in `test_pushdown.py` for the anti-join fix below.
+
+| Piece | What |
+|---|---|
+| `session.catalog` | `listCatalogs` / `listDatabases` / `listTables` / `listColumns` / `listFunctions`, the `*exists` and `get*` pairs, `createTable`, `dropTable`, `setCurrentDatabase`, `refreshTable`, `clearCache` |
+| SQL DDL | `CREATE [OR REPLACE] TABLE`, `IF NOT EXISTS`, column lists with `NOT NULL`, `USING iceberg`, `PARTITIONED BY` with transforms, `TBLPROPERTIES`, `COMMENT`, CTAS, `DROP TABLE`, `CREATE`/`DROP NAMESPACE\|DATABASE\|SCHEMA` |
+| `ALTER TABLE` | `ADD`/`DROP`/`RENAME COLUMN`, `ALTER COLUMN` (comment, `DROP NOT NULL`), `RENAME TO`, `SET`/`UNSET TBLPROPERTIES` |
+| Evolution | `ADD`/`DROP`/`REPLACE PARTITION FIELD`, `WRITE ORDERED BY`, `WRITE UNORDERED`, and `mergeSchema` on write |
+| Time travel | `VERSION AS OF` / `TIMESTAMP AS OF`, and `session.read.option("snapshot-id"\|"as-of-timestamp")` |
+| Metadata tables | `t.snapshots`, `.history`, `.files`, `.manifests`, `.partitions`, `.refs` and the rest of PyIceberg's `inspect` |
+
+### Three silent wrong answers, two of them older than this phase
+
+This is the phase that found them, not the phase that caused them. All three are in
+FINDINGS.md with the full account.
+
+**1. A source view name was reused, so a table was described as another one**
+(FINDINGS §1.9, reachable since Phase 7). Source view names were numbered
+`icetl_src_{len(self._sources)}` — from how many sources are *cached*, a count that goes
+back **down** when `_invalidate_source` removes one. The next source took a name an
+earlier one had used, the analyser registers a view name only once, and the reused name
+kept the earlier table's schema. Read A, write to A, read B, and `B.columns` returned A's.
+
+Phases 7 and 8 could reach it and never showed it: the *snapshot* changed but the
+*schema* did not, so the stale view had the right columns. A schema change is what makes
+it visible, which is why it waited for this phase. View names now come from the session's
+monotonic counter, and invalidation unregisters the view.
+
+**2. An anti-join returned every row instead of none** (FINDINGS §1.10, reachable since
+Phase 4). `LEFT JOIN b … WHERE b.id IS NULL` selects the rows where the join found
+nothing. The conjunct was pushed into `b`'s Iceberg scan like any other, PyIceberg pruned
+every file — no data file holds a NULL id — and every left row survived.
+
+This is **the one case where pruning changed the answer**, and it is worth being precise
+about why §3.2's invariant did not cover it. "The pushed filter is always kept in the
+SQL" holds for the filter; the rows it prunes were needed so the join would *not* match.
+A row of NULLs on the padded side is manufactured by the join, not read from the table.
+
+`null_padded_aliases` now finds the aliases an outer join can fill with NULLs, and only
+conjuncts that `is_null_rejecting` — that a row of NULLs could not satisfy — are pushed
+into them. `WHERE b.date = X` still prunes to one file; only `IS NULL` and its
+kin are held back, so the fix costs nothing on the ordinary outer join.
+
+**3. A column added by `ALTER TABLE` made the table unreadable** (FINDINGS §1.11). The
+machinery existed and the gate did not: `ColumnAlias(stored=None)` has projected a typed
+NULL since Phase 2, but the reconciliation path was entered only when a column had been
+**renamed**, and an added column has one name and no history. `read_parquet` cannot
+produce a column no file has, so it raised. `_late_columns` reads the schema *history* —
+a field id missing from any earlier schema is one some file can predate — and enters the
+same path, still O(schemas) and still opening no footers on a table that never changed.
+
+### And one loud failure that had made the writer unusable for real data
+
+`df.write.saveAsTable(...)` could not create a table from a frame carrying a **timestamp**
+column, and had not been able to since Phase 7. DuckDB stamps a `TIMESTAMP WITH TIME ZONE`
+with the *session's own* zone — `timestamp[us, tz=Asia/Calcutta]` here — and Iceberg's
+`timestamptz` is UTC by definition, so PyIceberg refuses anything else outright. No `fx.*`
+fixture had a timestamp column and the real `nyc` table is only ever read, so nothing
+reached it. `writer.iceberg_ready` now relabels the type on the way in — zone to UTC,
+nanoseconds to microseconds — which moves no value, because both sides are instants.
+
+### Why a created table is not built by the writer
+
+`CREATE TABLE t (id BIGINT NOT NULL)` says something DuckDB cannot: the analysed schema
+calls every field nullable, which is the Phase 7 divergence. Handing the frame to
+`saveAsTable` would have dropped the constraint silently.
+
+So the DataType goes through the **existing** `createDataFrame` path to an Arrow schema —
+no second type mapping to keep in step — and the declared columns are marked non-nullable
+before PyIceberg is asked. `TestNullability` pins both halves, including the contrast: a
+table created by a *write* is still all-optional, and that is still correct.
+
+### Time travel is a property of the source key
+
+`VERSION AS OF` is folded into the key a table reference resolves under, so the same table
+at two snapshots is two sources that join to each other:
+
+```sql
+SELECT o.id FROM t VERSION AS OF 8271497619288662701 AS o
+LEFT JOIN t AS n ON o.id = n.id WHERE n.id IS NULL   -- the rows a delete removed
+```
+
+Nothing downstream needed a flag threaded through it, and `session.read.option(...)`
+builds the same node the SQL does, so the two surfaces cannot drift (P1). The *schema*
+stays the current one, which is what PyIceberg's own scan does and the reference does not
+— recorded in `divergence.md`. And a snapshot is history, so `assert_no_version` refuses
+DELETE, UPDATE, MERGE and DDL against one.
+
+### sqlglot parses most of the DDL, and says so when it does not
+
+`ALTER TABLE t DROP COLUMN a` (singular), `UNSET TBLPROPERTIES`, and the whole of
+Iceberg's Spark SQL extensions come back as `exp.Command` — sqlglot's explicit "I did not
+understand this, here is the text". `run_alter_command` reads those few forms itself, a
+deliberately small grammar with everything outside it refused by name.
+
+`DROP PARTITION FIELD` is the exception: it gets far enough into sqlglot's own
+`DROP PARTITION` rule to fail outright rather than fall back, so `Session.sql()` offers
+the text to that grammar before letting the parse error stand.
+
+### Refused rather than half-done
+
+| | Why |
+|---|---|
+| `ALTER COLUMN … TYPE` | Iceberg allows only widening promotions and PyIceberg 0.11 exposes no type update; doing it here would rewrite every file |
+| `ADD COLUMN … NOT NULL` | existing rows would have no value for it |
+| `catalog.cacheTable` | caching here is per-frame and eager; a name-level cache would have to shadow the table for both surfaces and go stale behind a write |
+| `CREATE TABLE … LOCATION` | the catalog owns the location |
+| global temporary views | there is one session, so there is no one to share with |
+
+### Carried forward
+
+- **A monotonic counter, not a collection's size.** §1.9's root cause. `_materialize` had
+  always used `self._counter` and was never affected; `_source_for` did not.
+- **Pruning is safe *except* under an outer join.** §1.10 is the only exception found so
+  far, and `is_null_rejecting` is where the next one would go.
+- **An inner join's `WHERE` conjunct is folded into `ON` and stops pruning** — measured,
+  a gap rather than a bug, and Phase 10's. FINDINGS §3.5.
 
 ---
 

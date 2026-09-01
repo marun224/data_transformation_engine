@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from datetime import UTC
 from typing import TYPE_CHECKING, Any
 
 import sqlglot
@@ -25,9 +26,11 @@ from icetl.catalog import CatalogRegistry, TableResolver
 from icetl.compat import SQL_DIALECT
 from icetl.conf import IcetlConf, IcetlSettings, resolve_settings
 from icetl.errors import (
+    AnalysisException,
     EngineTypeError,
     EngineValueError,
     ParseException,
+    QueryExecutionException,
     TempTableAlreadyExistsException,
     UnsupportedFeatureError,
 )
@@ -38,16 +41,20 @@ from icetl.plan.analysis import PlanAnalyzer
 from icetl.plan.annotations import PlanAnnotations
 from icetl.plan.builder import (
     ScanSource,
+    assert_no_version,
     collect_source_keys,
     source_key,
     source_table,
+    split_version,
     substitute_sources,
 )
 from icetl.plan.optimizer import OptimizedPlan, optimize_plan
 from icetl.plan.pushdown import extract_scan_requests
 from icetl.plan.schema import SchemaBinder
+from icetl.sql.catalog import Catalog as SessionCatalog
 from icetl.sql.conformance import apply_compat_semantics
 from icetl.sql.dataframe import DataFrame
+from icetl.sql.reader import DataFrameReader
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -65,11 +72,26 @@ __all__ = ["CompiledPlan", "Session"]
 REFERENCE_SEMANTICS_VERSION = "3.5.0"
 
 # Statement types Phase 1 can run. Everything else has a phase that owns it.
-_DDL_PHASES: dict[type[exp.Expression], tuple[str, str]] = {
-    exp.Create: ("CREATE", "Phase 9"),
-    exp.Drop: ("DROP", "Phase 9"),
-    exp.Alter: ("ALTER", "Phase 9"),
-}
+#: Iceberg's metadata tables, addressed as a suffix on the table name. Every one is a
+#: method of PyIceberg's `Table.inspect`, which is where the rows come from.
+METADATA_TABLES = frozenset(
+    {
+        "snapshots",
+        "history",
+        "files",
+        "data_files",
+        "delete_files",
+        "all_files",
+        "all_data_files",
+        "all_delete_files",
+        "manifests",
+        "all_manifests",
+        "partitions",
+        "refs",
+        "entries",
+        "metadata_log_entries",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -131,6 +153,7 @@ class Session:
         self._sources: dict[str, ScanSource] = {}
         self._counter = 0
         self._cached: set[str] = set()
+        self._catalog_facade: SessionCatalog | None = None
         self._temp_views: dict[str, exp.Expression] = {}
         self._lock = threading.Lock()
         self._stopped = False
@@ -243,16 +266,20 @@ class Session:
         return self._settings
 
     @property
-    def catalog(self) -> Any:
-        raise UnsupportedFeatureError("Session.catalog", phase="Phase 9")
+    def catalog(self) -> SessionCatalog:
+        """`session.catalog` -- listing, describing and managing what the catalog holds."""
+        if self._catalog_facade is None:
+            self._catalog_facade = SessionCatalog(self)
+        return self._catalog_facade
 
     @property
-    def read(self) -> Any:
-        raise UnsupportedFeatureError(
-            "Session.read",
-            phase="Phase 11",
-            hint="Use Session.table() for Iceberg tables",
-        )
+    def read(self) -> DataFrameReader:
+        """`session.read` -- an Iceberg table, optionally at an earlier snapshot.
+
+        The file-format readers (`parquet`, `csv`, `json`) are Phase 11; what this
+        carries today is time travel.
+        """
+        return DataFrameReader(self)
 
     @property
     def udf(self) -> Any:
@@ -355,9 +382,11 @@ class Session:
             # A temporary view shadows a catalog table of the same name, as it does in
             # the reference -- registering one is how you override a table for a session.
             plan = view.copy()
-            return DataFrame(
-                self, plan, {k: self._source_for(k) for k in collect_source_keys(plan)}
-            )
+            return DataFrame(self, plan, self._sources_for(plan))
+        relation = self._metadata_relation(tableName)
+        if relation is not None:
+            plan = exp.select(exp.Star()).from_(exp.to_identifier(relation, quoted=True))
+            return DataFrame(self, plan, {})
         source = self._source_for(tableName)
         plan = exp.select(exp.Star()).from_(source_table(tableName))
         return DataFrame(self, plan, {source.key: source})
@@ -374,6 +403,13 @@ class Session:
         try:
             statements = sqlglot.parse(sqlQuery, read=SQL_DIALECT)
         except Exception as exc:
+            # Iceberg's Spark SQL extensions are not in any sqlglot dialect. Most fall
+            # back to `exp.Command`, which is handled below -- but `DROP PARTITION FIELD`
+            # gets far enough into sqlglot's own `DROP PARTITION` rule to fail outright,
+            # so the ALTER grammar in `ddl.py` is offered the text before giving up.
+            recovered = self._try_alter_extension(sqlQuery)
+            if recovered is not None:
+                return recovered
             raise ParseException(f"Could not parse the query: {exc}") from exc
 
         parsed = [s for s in statements if s is not None]
@@ -393,15 +429,18 @@ class Session:
                     "df.createOrReplaceTempView('name') and then query it by name"
                 ),
             )
+        if isinstance(plan, (exp.Create, exp.Drop, exp.Alter)):
+            return self._ddl(plan)
+        if isinstance(plan, exp.Command) and str(plan.this).upper() == "ALTER":
+            # sqlglot parses no Iceberg SQL extension and not every ALTER spelling; it
+            # hands back the raw text instead, which `ddl.py` reads itself.
+            return self._ddl(plan)
         if isinstance(plan, exp.Insert):
             return self._insert(plan)
         # Row-level operations (Phase 8). Each rewrites data files and returns nothing,
         # so they are statements in the same sense INSERT is.
         if isinstance(plan, (exp.Delete, exp.Update, exp.Merge)):
             return self._row_level(plan)
-        for node_type, (keyword, phase) in _DDL_PHASES.items():
-            if isinstance(plan, node_type):
-                raise UnsupportedFeatureError(f"{keyword} statements", phase=phase)
         # `exp.SetOperation` rather than `exp.Union`: INTERSECT and EXCEPT are its
         # siblings, and naming only the one had them rejected as unimplemented when
         # sqlglot parsed them and DuckDB ran them perfectly well.
@@ -411,8 +450,8 @@ class Session:
             )
 
         plan = self._inline_temp_views(plan)
-        sources = {key: self._source_for(key) for key in collect_source_keys(plan)}
-        return DataFrame(self, plan, sources)
+        plan = self._inline_metadata_tables(plan)
+        return DataFrame(self, plan, self._sources_for(plan))
 
     def _insert(self, plan: exp.Insert) -> DataFrame:
         """Run `INSERT INTO t SELECT ...` / `INSERT OVERWRITE t SELECT ...`.
@@ -447,10 +486,41 @@ class Session:
                 hint="INSERT INTO t SELECT ... is the supported form",
             )
 
+        assert_no_version(target, "INSERT INTO")
         source = self._frame_for(query)
         name = source_key(target)
         overwrite = bool(plan.args.get("overwrite"))
         source.write.mode("overwrite" if overwrite else "append").insertInto(name)
+        return self._empty_frame()
+
+    def _try_alter_extension(self, sqlQuery: str) -> DataFrame | None:
+        """Run an `ALTER` sqlglot could not parse at all, if `ddl.py` knows the form."""
+        from icetl.sql import ddl
+
+        text = sqlQuery.strip().rstrip(";")
+        if not text.upper().startswith("ALTER "):
+            return None
+        command = exp.Command(this="ALTER", expression=text[len("ALTER") :])
+        try:
+            ddl.run_alter_command(self, command)
+        except UnsupportedFeatureError:
+            # Not a form we know either -- let the parse error stand, since it says more.
+            return None
+        return self._empty_frame()
+
+    def _ddl(self, plan: exp.Expression) -> DataFrame:
+        """Run a DDL statement, then hand back the empty frame a statement returns."""
+        from icetl.sql import ddl
+
+        if isinstance(plan, exp.Create):
+            ddl.run_create(self, plan)
+        elif isinstance(plan, exp.Drop):
+            ddl.run_drop(self, plan)
+        elif isinstance(plan, exp.Alter):
+            ddl.run_alter(self, plan)
+        else:
+            assert isinstance(plan, exp.Command)
+            ddl.run_alter_command(self, plan)
         return self._empty_frame()
 
     def _row_level(self, plan: exp.Delete | exp.Update | exp.Merge) -> DataFrame:
@@ -473,9 +543,8 @@ class Session:
 
     def _frame_for(self, query: exp.Expression) -> DataFrame:
         """A DataFrame over an already-parsed query, with its sources resolved."""
-        plan = self._inline_temp_views(query)
-        sources = {key: self._source_for(key) for key in collect_source_keys(plan)}
-        return DataFrame(self, plan, sources)
+        plan = self._inline_metadata_tables(self._inline_temp_views(query))
+        return DataFrame(self, plan, self._sources_for(plan))
 
     def _empty_frame(self) -> DataFrame:
         """The no-column, no-row frame a statement returns."""
@@ -489,15 +558,27 @@ class Session:
         cached = self._sources.get(reference)
         if cached is not None:
             return cached
-        resolved = self._resolver.resolve(reference)
+        name, kind, value = split_version(reference)
+        resolved = self._resolver.resolve(name)
+        snapshot_id = _snapshot_for(resolved, kind, value) if kind else None
         with self._lock:
             # Re-check inside the lock: two threads resolving the same reference must
             # end up with one view name, not two.
             existing = self._sources.get(reference)
             if existing is not None:
                 return existing
+            # Numbered from the session's monotonic counter, **not** from how many
+            # sources are cached. Invalidation removes entries, so `len(self._sources)`
+            # goes back down and hands the next source a name an earlier one used -- and
+            # the analyzer registers a view name only once, so the reused name would keep
+            # the earlier table's schema. That is a wrong answer, not a stale one:
+            # `df.columns` would describe a different table. See FINDINGS.md.
+            self._counter += 1
             source = ScanSource(
-                key=reference, resolved=resolved, view=f"icetl_src_{len(self._sources)}"
+                key=reference,
+                resolved=resolved,
+                view=f"icetl_src_{self._counter}",
+                snapshot_id=snapshot_id,
             )
             self._sources[reference] = source
         return source
@@ -517,12 +598,18 @@ class Session:
         """
         with self._lock:
             stale = [
-                key
-                for key, source in self._sources.items()
+                source
+                for source in self._sources.values()
                 if source.resolved.ref.identifier == ref.identifier
             ]
-            for key in stale:
-                del self._sources[key]
+            for source in stale:
+                del self._sources[source.key]
+        # The analysis view goes too. Monotonic naming already makes a reused name
+        # impossible; dropping it also keeps a long-lived session from accumulating one
+        # zero-row view per write, and means a *schema* change is picked up rather than
+        # only a snapshot change.
+        for source in stale:
+            self._analyzer.unregister_view(source.view)
 
     def _next_alias(self) -> str:
         """A subquery alias unique within this session, so nesting never collides."""
@@ -615,6 +702,72 @@ class Session:
 
         return plan.transform(replace, copy=True)
 
+    def _inline_metadata_tables(self, plan: exp.Expression) -> exp.Expression:
+        """Replace `ns.table.snapshots` and friends with the rows they describe.
+
+        Iceberg's metadata tables are addressed as a suffix on the table name, exactly as
+        the reference addresses them, and PyIceberg already computes each one. They are
+        **materialised at plan time** -- the rows are read now, registered in both
+        engines, and queried from there -- because they are metadata rather than a scan:
+        there are no data files to prune and no predicate to push down.
+
+        Done before source keys are collected, so the optimizer, pushdown and the scan
+        planner never learn that metadata tables exist. That is also what makes them work
+        identically from `session.table()` and from SQL (P1).
+        """
+        bound = {cte.alias_or_name for cte in plan.find_all(exp.CTE) if cte.alias_or_name}
+
+        def replace(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Table) or isinstance(node.this, exp.Func):
+                return node
+            if node.name in bound:
+                return node
+            name = self._metadata_relation(source_key(node))
+            if name is None:
+                return node
+            alias = exp.TableAlias(this=exp.to_identifier(node.alias or node.name, quoted=True))
+            return exp.Table(this=exp.to_identifier(name, quoted=True), alias=alias)
+
+        return plan.transform(replace, copy=True)
+
+    def _sources_for(self, plan: exp.Expression) -> dict[str, ScanSource]:
+        """Resolve every table reference in `plan` that the catalog owns.
+
+        A relation this session materialised -- a cached frame, a `createDataFrame`, an
+        inlined metadata table -- is a plain DuckDB temp table, and it is spelled as a
+        table reference like any other. Resolving one against the catalog would look for
+        `icetl_cache_13` in the current namespace and fail, so the names the session
+        knows it made are skipped.
+        """
+        return {
+            key: self._source_for(key)
+            for key in collect_source_keys(plan)
+            if key not in self._cached
+        }
+
+    def _metadata_relation(self, reference: str) -> str | None:
+        """Materialise the metadata table `reference` names, or None if it is not one."""
+        parts = reference.split(".")
+        if len(parts) < 2:
+            return None
+        kind = parts[-1].lower()
+        if kind not in METADATA_TABLES:
+            return None
+        base = ".".join(parts[:-1])
+        try:
+            resolved = self._resolver.resolve(base)
+        except Exception:
+            # `a.b.snapshots` where `a.b` is not a table is an ordinary missing table,
+            # and saying so is the resolver's job, not this one's.
+            return None
+        try:
+            rows = getattr(resolved.table.inspect, kind)()
+        except Exception as exc:
+            raise QueryExecutionException(
+                f"Could not read the {kind!r} metadata of {base!r}: {exc}"
+            ) from exc
+        return self._materialize(rows)
+
     # -- the compile pipeline ---------------------------------------------
 
     def _analyze(self, plan: exp.Expression, sources: Mapping[str, ScanSource]) -> StructType:
@@ -703,6 +856,64 @@ class Session:
     def __repr__(self) -> str:
         name = self._conf.get("icetl.appName", "icetl")
         return f"<Session app={name!r} catalog={self._settings.catalog.name!r}>"
+
+
+def _snapshot_for(resolved: Any, kind: str | None, value: str | None) -> int:
+    """The snapshot a `VERSION AS OF` / `TIMESTAMP AS OF` names.
+
+    `VERSION AS OF n` is a **snapshot id**, which is what the reference means for an
+    Iceberg table -- there is no separate version counter to confuse it with.
+    `TIMESTAMP AS OF t` is the newest snapshot committed at or before `t`, so a
+    timestamp between two commits reads the earlier one, as time travel should.
+    """
+    table = resolved.table
+    snapshots = list(table.snapshots())
+    if not snapshots:
+        raise AnalysisException(f"Table {resolved.qualified_name!r} has no snapshots to travel to.")
+    if kind == "VERSION":
+        try:
+            wanted = int(str(value))
+        except (TypeError, ValueError):
+            raise AnalysisException(f"VERSION AS OF needs a snapshot id, got {value!r}.") from None
+        if table.snapshot_by_id(wanted) is None:
+            known = ", ".join(str(snapshot.snapshot_id) for snapshot in snapshots[-5:])
+            raise AnalysisException(
+                f"Table {resolved.qualified_name!r} has no snapshot {wanted}. "
+                f"Recent snapshot ids: {known}."
+            )
+        return wanted
+
+    millis = _as_millis(value)
+    reachable = [s for s in snapshots if s.timestamp_ms <= millis]
+    if not reachable:
+        earliest = min(s.timestamp_ms for s in snapshots)
+        raise AnalysisException(
+            f"Table {resolved.qualified_name!r} has no snapshot at or before {value!r}; "
+            f"its first is at {_as_text(earliest)}."
+        )
+    return max(reachable, key=lambda snapshot: snapshot.timestamp_ms).snapshot_id
+
+
+def _as_millis(value: str | None) -> int:
+    """A `TIMESTAMP AS OF` literal as epoch milliseconds."""
+    from datetime import datetime
+
+    text = str(value or "").strip().replace(" ", "T")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise AnalysisException(
+            f"TIMESTAMP AS OF needs an ISO-8601 timestamp, got {value!r}."
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
+
+
+def _as_text(millis: int) -> str:
+    from datetime import datetime
+
+    return datetime.fromtimestamp(millis / 1000, tz=UTC).isoformat()
 
 
 def _schema_fields(schema: Any) -> list[Any] | None:

@@ -48,7 +48,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
 from icetl.plan.annotations import PlanAnnotations, ScanRequest
-from icetl.plan.builder import source_key
+from icetl.plan.builder import as_expression, source_key
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -62,6 +62,8 @@ __all__ = [
     "binds_against",
     "extract_scan_requests",
     "is_exactly_translatable",
+    "is_null_rejecting",
+    "null_padded_aliases",
     "scope_predicate",
     "translate_predicate",
 ]
@@ -425,6 +427,62 @@ def scope_predicate(
     return predicate, kept, dropped
 
 
+def null_padded_aliases(expression: exp.Expression) -> set[str]:
+    """Aliases in this scope that an outer join can fill with NULLs.
+
+    The right of a `LEFT JOIN`, everything left of a `RIGHT JOIN`, and both sides of a
+    `FULL JOIN`. A row of NULLs there is manufactured by the join, not read from the
+    table -- which is what makes a `WHERE` conjunct over it something other than a
+    filter on its rows.
+    """
+    if not isinstance(expression, exp.Select):
+        return set()
+    padded: set[str] = set()
+    seen: list[str] = []
+    source = expression.args.get("from")
+    if source is not None:
+        seen.append(source.this.alias_or_name)
+    for join in expression.args.get("joins") or []:
+        side = str(join.args.get("side") or "").upper()
+        right = join.this.alias_or_name
+        if side in ("LEFT", "FULL"):
+            padded.add(right)
+        if side in ("RIGHT", "FULL"):
+            padded.update(seen)
+        seen.append(right)
+    return padded
+
+
+def is_null_rejecting(node: exp.Expression) -> bool:
+    """True when `node` cannot be satisfied by a row of NULLs.
+
+    The gate on pushing a `WHERE` conjunct into a table an outer join can null-pad.
+    `WHERE b.id IS NULL` over the right of a `LEFT JOIN` is the anti-join idiom: it
+    selects the rows where the join found **nothing**, so pushing it into `b`'s scan
+    prunes away exactly the files that make the answer right, and the query returns
+    every left row instead of the unmatched ones. Reading less is normally free; here
+    it changes the answer, which is the one case pushdown must refuse.
+
+    Conservative in the safe direction -- an unrecognised shape is treated as *not*
+    null-rejecting, which costs pruning and never correctness.
+    """
+    if isinstance(node, exp.Paren):
+        return is_null_rejecting(node.this)
+    if isinstance(node, exp.And):
+        first, second = _operands(node)
+        return is_null_rejecting(first) or is_null_rejecting(second)
+    if isinstance(node, exp.Or):
+        first, second = _operands(node)
+        return is_null_rejecting(first) and is_null_rejecting(second)
+    if isinstance(node, exp.Not):
+        # `IS NOT NULL` is the one negation that plainly rejects a NULL row.
+        inner = node.this
+        return isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null)
+    if isinstance(node, exp.Is):
+        return not isinstance(node.expression, exp.Null)
+    return True
+
+
 def _unattributed(scope: Any, resolver: ColumnResolver) -> list[str]:
     """Unqualified columns in `scope`, classified into what they actually refer to.
 
@@ -484,11 +542,12 @@ def extract_scan_requests(
 
     for scope in traverse_scope(optimized):
         terms = conjuncts(scope.expression.args.get("where"))
+        padded = null_padded_aliases(as_expression(scope.expression))
 
         for alias, node in scope.sources.items():
             if not isinstance(node, exp.Table) or isinstance(node.this, exp.Func):
                 continue
-            source = sources.get(source_key(node))
+            source = sources.get(source_key(node, versioned=True))
             if source is None:
                 continue
 
@@ -497,7 +556,12 @@ def extract_scan_requests(
                 alias, {field.name: field.field_type for field in schema.fields}
             )
 
-            predicate, _, dropped = scope_predicate(terms, resolver, schema)
+            # A table an outer join can null-pad only accepts conjuncts that a row of
+            # NULLs could not satisfy. See `is_null_rejecting`.
+            usable = (
+                [term for term in terms if is_null_rejecting(term)] if alias in padded else terms
+            )
+            predicate, _, dropped = scope_predicate(usable, resolver, schema)
             # A term mentioning another table is not "unpushed" for this one, it is
             # simply none of its business, so it is not reported against it.
             unpushed = [

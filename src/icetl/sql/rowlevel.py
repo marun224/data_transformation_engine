@@ -58,7 +58,7 @@ from icetl.errors import (
     QueryExecutionException,
     UnsupportedFeatureError,
 )
-from icetl.plan.builder import source_key
+from icetl.plan.builder import assert_no_version, source_key
 from icetl.plan.pushdown import ColumnResolver, conjuncts, scope_predicate
 from icetl.sql.writer import commit_with_retry
 
@@ -137,6 +137,7 @@ def _resolve_target(session: Session, node: exp.Table) -> _Target:
     to are the same object at the same snapshot, so the check before the commit is
     checking the thing that was actually read.
     """
+    assert_no_version(node, "DELETE / UPDATE / MERGE against")
     key = source_key(node)
     probe = session._resolver.resolve(key)
     session._invalidate_source(probe.ref)

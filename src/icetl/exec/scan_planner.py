@@ -177,6 +177,34 @@ def _renamed_columns(table: Table, columns: tuple[str, ...]) -> tuple[str, ...]:
     )
 
 
+def _late_columns(table: Table, columns: tuple[str, ...]) -> tuple[str, ...]:
+    """Which of `columns` some data file may predate.
+
+    A column added by `ALTER TABLE ... ADD COLUMN` is not in the files written before
+    it, and `read_parquet` cannot produce a column no file has -- it raises *Referenced
+    column not found*, so a table that had a column added stops being readable at all.
+    Iceberg's answer is NULL for those rows, which `ColumnAlias(stored=None)` already
+    projects; what was missing was noticing that the case had arisen.
+
+    Detected from the **schema history**, which is already loaded: a field id absent
+    from any earlier schema is one some file can predate. O(schemas), like the rename
+    check beside it, so a table whose schema has never changed still takes the fast
+    path and opens no footers.
+    """
+    schemas = list(table.schemas().values())
+    if len(schemas) < 2:
+        return ()
+    ids = _field_ids(table)
+    everywhere = set.intersection(
+        *({nested.field_id for nested in schema.fields} for schema in schemas)
+    )
+    return tuple(
+        name
+        for name in columns
+        if (field_id := ids.get(name)) is not None and field_id not in everywhere
+    )
+
+
 def _footer_names(table: Table, path: str) -> dict[int, str]:
     """`{field_id: column name}` as one parquet file actually spells them.
 
@@ -292,14 +320,19 @@ def plan_scan(source: ScanSource, request: ScanRequest | None = None) -> ScanPla
     scan = table.scan(
         row_filter=request.predicate,
         selected_fields=("*",) if reads_every_column else columns,
+        # None reads the table as it is now; a snapshot id is `VERSION AS OF`. The
+        # *schema* stays the current one either way, which is what PyIceberg's own scan
+        # does -- recorded in divergence.md, because the reference uses the snapshot's.
+        snapshot_id=source.snapshot_id,
     )
     tasks = list(scan.plan_files())
     _assert_copy_on_write(source, tasks)
 
     renamed = _renamed_columns(table, columns)
+    reconciled = renamed or _late_columns(table, columns)
     if not tasks:
         groups: tuple[FileGroup, ...] = ()
-    elif renamed:
+    elif reconciled:
         groups = _grouped_by_stored_names(table, tasks, columns, duckdb_types)
     else:
         groups = (

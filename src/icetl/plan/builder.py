@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, cast
 
 from sqlglot import exp
 
+from icetl.errors import UnsupportedFeatureError
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -53,26 +55,82 @@ def as_expression(node: object) -> exp.Expression:
 
 @dataclass(frozen=True)
 class ScanSource:
-    """One Iceberg table referenced by a plan.
+    """One Iceberg table referenced by a plan, at one snapshot.
 
     `key` is the reference as it is spelled in the tree (`fx.plain`), which is what
-    substitution matches on. `view` is the name its zero-row stand-in is registered
-    under during analysis; it is kept off the `key` namespace so a real table called
-    `icetl_src_0` could not collide with it.
+    substitution matches on -- and it carries the `VERSION AS OF` a reference was
+    written with, so the same table at two snapshots is two sources and joins to
+    itself. `view` is the name its zero-row stand-in is registered under during
+    analysis; it is kept off the `key` namespace so a real table called `icetl_src_0`
+    could not collide with it.
+
+    `snapshot_id` is None for the ordinary "as it is now" read.
     """
 
     key: str
     resolved: ResolvedTable
     view: str
+    snapshot_id: int | None = None
 
 
-def source_key(table: exp.Table) -> str:
+#: Separates a reference from the version it was asked for inside a source key. NUL
+#: cannot appear in a SQL identifier, quoted or not, so a key carrying one is
+#: unambiguously ours and never a table someone named awkwardly.
+VERSION_MARK = chr(0) + "@"
+
+
+def source_key(table: exp.Table, *, versioned: bool = False) -> str:
     """The dotted reference a table node spells, ignoring any alias.
 
     `nyc.yellow_tripdata AS t` -> `nyc.yellow_tripdata`.
+
+    With `versioned`, a `VERSION AS OF` / `TIMESTAMP AS OF` is folded into the key, so
+    two references to one table at different snapshots resolve to two sources. Callers
+    that address a table to *write* to it leave it off: there is no writing to a
+    snapshot, and a version on a write target is refused where it is read.
     """
     parts = [part for part in (table.catalog, table.db, table.name) if part]
-    return ".".join(parts)
+    key = ".".join(parts)
+    if not versioned:
+        return key
+    version = table.args.get("version")
+    if version is None:
+        return key
+    kind = str(version.this or "").upper()
+    value = version.args.get("expression")
+    return f"{key}{VERSION_MARK}{kind}:{value.name if value is not None else ''}"
+
+
+def assert_no_version(table: exp.Table, action: str) -> None:
+    """Refuse `VERSION AS OF` where a statement is going to *write*.
+
+    Time travel names a snapshot that has already been committed. There is nothing to
+    write to it, and quietly writing to the table's current state instead would be a
+    statement doing something other than what it says.
+    """
+    version = table.args.get("version")
+    if version is not None:
+        raise UnsupportedFeatureError(
+            f"{action} a table at {str(version.this or '').upper()} AS OF",
+            hint="A snapshot is history. Write to the table itself",
+        )
+
+
+def split_version(key: str) -> tuple[str, str | None, str | None]:
+    """a key carrying the mark -> `("fx.plain", "VERSION", "5")`."""
+    if VERSION_MARK not in key:
+        return key, None, None
+    reference, _, tail = key.partition(VERSION_MARK)
+    kind, _, value = tail.partition(":")
+    return reference, kind, value
+
+
+def describe_key(key: str) -> str:
+    """The key as a reader would write it, for an error message."""
+    reference, kind, value = split_version(key)
+    if kind is None:
+        return reference
+    return f"{reference} {kind} AS OF {value}"
 
 
 def source_table(reference: str) -> exp.Table:
@@ -109,7 +167,7 @@ def collect_source_keys(expression: exp.Expression) -> list[str]:
     for table in expression.find_all(exp.Table):
         if isinstance(table.this, exp.Func):
             continue
-        key = source_key(table)
+        key = source_key(table, versioned=True)
         if not key or key in bound or key in keys:
             continue
         keys.append(key)
@@ -130,7 +188,7 @@ def substitute_sources(
     def replace(node: exp.Expression) -> exp.Expression:
         if not isinstance(node, exp.Table) or isinstance(node.this, exp.Func):
             return node
-        source = sources.get(source_key(node))
+        source = sources.get(source_key(node, versioned=True))
         if source is None:
             return node
         replacement = factory(source)

@@ -172,6 +172,86 @@ assert, so it is written down instead. See `divergence.md`.
 **Found by:** running `notebooks/01_read_real_table.ipynb` section 8, which probes both
 surfaces side by side. 821 tests passed with the gap present.
 
+### 1.9 🔴 A source view name was reused, so a table was described as another one
+
+*Phase 9, reachable since Phase 7.* The analyser registers a zero-row view per scan
+source and registers each view name **once per session**. Source view names were numbered
+`icetl_src_{len(self._sources)}` — from how many sources are *cached*, a count that goes
+back **down** when `_invalidate_source` removes one. The next source then took a name an
+earlier one had used, found it already registered, and kept the earlier table's schema.
+
+**What it looked like:** read table A, write to A — which drops A's cached source — then
+read table B. `B.columns` returned **A's** columns. Analysis then bound B's plan against
+A's schema, so a real column of B could fail to resolve and a column B does not have
+could pass.
+
+```
+session.table(a).columns   ->  ['id', 'vendor', 'amount']
+session.table(a).write.mode("append").saveAsTable(a)
+session.table(b).columns   ->  ['id', 'vendor', 'amount']   <- but B's are different
+```
+
+**Why Phase 7 and 8 never saw it:** the *snapshot* changed but the *schema* did not, so
+the stale view had the right columns and nothing was visibly wrong. Phase 9 changes
+schemas, which is what made it show.
+
+**Guard:** view names come from the session's monotonic counter, so a name is never
+reused; and `_invalidate_source` unregisters the analysis view, so a schema change is
+picked up rather than only a snapshot change.
+`tests/fixture/test_ddl.py::TestSchemaChangesAreVisible`.
+
+**Rule:** a name derived from the size of a mutable collection is not unique. Counters
+are cheap; reuse is a wrong answer.
+
+### 1.10 🔴 An anti-join returned every row instead of none
+
+*Phase 9, reachable since Phase 4.* `LEFT JOIN b … WHERE b.id IS NULL` is the anti-join
+idiom: it selects the rows where the join found **nothing**. `extract_scan_requests`
+pushed that conjunct into `b`'s Iceberg scan like any other, PyIceberg pruned every file
+— no data file holds a NULL id — `b` read as empty, and every left row survived.
+
+```sql
+SELECT a.id FROM fx.plain AS a
+LEFT JOIN fx.partitioned AS b ON a.id = b.id
+WHERE b.id IS NULL
+-- returned [1,2,3,4,5]; the answer is []
+```
+
+**This is the one case where pruning changed the answer.** PLAN.md §3.2's invariant —
+"the pushed filter is always kept in the SQL, so pruning is only ever a way to read less"
+— holds for the *filter* and not for the rows: the pruned files were needed precisely so
+that the join would *not* match. A row of NULLs on the padded side is manufactured by the
+join, not read from the table, so a `WHERE` conjunct over it is not a filter on its rows.
+
+**Why the obvious test would have missed it:** with a *subquery* on the right, the
+conjunct is not in that scope's `WHERE` and never reaches the scan. It needs two bare
+table references.
+
+**Guard:** `null_padded_aliases` finds the aliases an outer join can fill with NULLs, and
+only conjuncts that `is_null_rejecting` — that a row of NULLs could not satisfy — are
+pushed into them. `WHERE b.date = X` still prunes to one file; `WHERE b.id IS NULL` no
+longer prunes at all. `tests/fixture/test_pushdown.py::TestOuterJoinsAreNotPrunedByTheirOwnNullChecks`.
+
+**Rule:** "reading less is always safe" is true only where reading less cannot change
+which rows *fail* to match. Outer joins are the exception, and they are the only one.
+
+### 1.11 🔴 A column added by `ALTER TABLE` made the table unreadable
+
+*Phase 9.* Iceberg reads a column added after a data file was written as NULL for that
+file's rows. `read_parquet` cannot produce a column no file has — it raises *Referenced
+column "amt" not found* — so a table that had a column added stopped being readable at
+all, which is loud, and the NULL semantics were never reached, which is what §3.4 had
+called the *safe* half of schema evolution.
+
+**The machinery already existed and the gate did not.** `ColumnAlias(stored=None)` has
+projected a typed NULL since Phase 2, and `_grouped_by_stored_names` produces exactly
+that for a field id absent from a file's footer. But the reconciliation path was entered
+only when a column had been **renamed**, and an added column has one name and no history.
+
+**Guard:** `_late_columns` reads the schema *history* — a field id missing from any
+earlier schema is one some file can predate — and enters the same path. O(schemas), like
+the rename check beside it, so a table whose schema never changed still opens no footers.
+
 ---
 
 ## 2. Loud failures — bugs that could not mislead
@@ -240,6 +320,35 @@ instead, so `scan_planner.py` only calls `plan_files()`. `ArrowScan` survives as
 12's** plan for the dirty half of the hybrid split (PLAN.md §3.3), which is where the
 double-counting trap will be waiting again.
 
+### 2.7 🟠 A timestamp column made a table impossible to create
+
+*Phase 9, reachable since Phase 7.* DuckDB stamps a `TIMESTAMP WITH TIME ZONE` with the
+**session's own** zone -- `timestamp[us, tz=Asia/Calcutta]` on the machine this was found
+on -- and Iceberg's `timestamptz` is UTC by definition, so PyIceberg refuses anything
+else: *Column 'ts' has an unsupported type*. Nanoseconds are refused for the same reason.
+
+So `df.write.saveAsTable(...)` could not create a table from a frame carrying a timestamp
+-- the single most common column type in an ETL job -- and had not been able to since the
+write path was built. **No `fx.*` fixture had a timestamp column**, and the real `nyc`
+table is only ever read, so nothing reached it.
+
+**Guard:** `writer.iceberg_ready` retypes timestamp columns on the way *into* Iceberg --
+zone to UTC, nanoseconds to microseconds. Neither converts the data: a zone-aware Arrow
+timestamp is an instant and so is Iceberg's, so it relabels and leaves every value where
+it was. `TestCreateTableAsSelect::test_a_timestamp_column_survives_the_round_trip`.
+
+**Rule:** a fixture set that omits a type omits every bug in it. Timestamps were the gap.
+
+### 2.8 🟠 PyIceberg's schema mismatches escaped the error hierarchy
+
+*Phase 9.* A required field given a NULL, a column the table does not have, a type that
+will not fit -- PyIceberg reports all of them as a bare `ValueError`, which travelled
+straight out through the write path. A caller catching `AnalysisException`, which is what
+`errors.py` exists for, heard nothing.
+
+**Guard:** `commit_with_retry` translates it, keeping PyIceberg's own message -- which is
+the useful part, and is what the Phase 7 test already matched on.
+
 ---
 
 ## 3. Performance findings
@@ -266,12 +375,28 @@ expensive than it is. Carry-over note 15, Phase 10.
 Iceberg's manifests already hold the row count. Roughly 2× on a 357-file table, and it
 grows with file count. Carry-over note 16, Phase 10.
 
-### 3.5 🟡 Two references to one table merge to a single scan — **open**
+### 3.5 🟡 An inner join's `WHERE` conjunct stops pruning — **open**
+
+*Phase 9, measured.* `pushdown_predicates` folds a `WHERE` conjunct over an
+**inner**-joined table into the join's `ON` clause, and `extract_scan_requests` reads only
+the scope's `WHERE` -- so the filter is applied by DuckDB and prunes no files. The same
+query written as a `LEFT JOIN` keeps the conjunct in `WHERE` and prunes to one file.
+
+```
+INNER JOIN ... WHERE b.as_at_date = '2026-08-16'   ->  3 of 3 files
+LEFT  JOIN ... WHERE b.as_at_date = '2026-08-16'   ->  1 of 3 files
+```
+
+Reading the `ON` clause as well is Phase 10 work. Pinned in
+`TestOuterJoinsAreNotPrunedByTheirOwnNullChecks` so the difference is not later mistaken
+for the outer-join fix on the same page.
+
+### 3.6 🟡 Two references to one table merge to a single scan — **open**
 
 Correct, and a union of columns with an OR of predicates, so a self-join with disjoint
 filters prunes less than it could. Carry-over note 11.
 
-### 3.6 🟡 `sum(double)` varies in its last digits between runs
+### 3.7 🟡 `sum(double)` varies in its last digits between runs
 
 DuckDB's aggregation order over parallel scans. Expected for floats; Spark does the same.
 Documented rather than fixed.
@@ -403,7 +528,8 @@ since paid off:
 | — | `size(NULL)` is `NULL` on both surfaces; the reference says `-1` | **Phase 15** |
 | §3.3 | `explain()`'s `bytes_scanned` ignores column pruning | Phase 10 |
 | §3.4 | An unfiltered `count(*)` reads parquet footers | Phase 10 |
-| §3.5 | A self-join with disjoint filters prunes less than it could | Phase 4 note 11 |
-| §3.6 | `sum(double)` varies in its last digits | documented, not fixed |
+| §3.5 | An inner join's `WHERE` conjunct is folded into `ON` and stops pruning | Phase 10 |
+| §3.6 | A self-join with disjoint filters prunes less than it could | Phase 4 note 11 |
+| §3.7 | `sum(double)` varies in its last digits | documented, not fixed |
 | — | Rename reconciliation is local-fixture-only and opens one footer per file; wants a benchmark before it meets a 4096-file table | Phase 2 leftover |
 | — | The `MERGE` cardinality check fires for a by-source-only merge; whether the reference does too is unmeasured | Phase 8 |

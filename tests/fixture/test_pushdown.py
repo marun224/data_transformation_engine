@@ -289,3 +289,82 @@ class TestUnbindablePlansStillRun:
     @pytest.mark.parametrize("reference", ["fx.plain", "fx.partitioned", "fx.wide"])
     def test_every_fixture_still_reads_end_to_end(self, session: Session, reference: str) -> None:
         assert session.table(reference).count() > 0
+
+
+class TestOuterJoinsAreNotPrunedByTheirOwnNullChecks:
+    """The anti-join idiom, and the one case where pruning changed the answer.
+
+    `LEFT JOIN b ... WHERE b.id IS NULL` selects the rows where the join found nothing.
+    Pushing that conjunct into `b`'s Iceberg scan pruned away every file -- no data file
+    holds a NULL id -- so `b` read as empty, *every* left row survived the anti-join, and
+    the query returned all of them instead of none.
+
+    Reachable since Phase 4, silent, and it needs two bare table references: with a
+    subquery on the right, the conjunct is not in that scope's WHERE and never reaches
+    the scan. FINDINGS.md §1.10.
+    """
+
+    def test_an_antijoin_over_two_tables_answers_correctly(self, session: Session) -> None:
+        """`fx.partitioned` holds ids 0-11, so every id in `fx.plain` matches."""
+        rows = session.sql(
+            "SELECT a.id FROM fx.plain AS a "
+            "LEFT JOIN fx.partitioned AS b ON a.id = b.id "
+            "WHERE b.id IS NULL"
+        ).collect()
+        assert [row[0] for row in rows] == []
+
+    def test_it_finds_the_rows_that_really_are_unmatched(self, session: Session) -> None:
+        rows = session.sql(
+            "SELECT a.id FROM fx.partitioned AS a "
+            "LEFT JOIN fx.plain AS b ON a.id = b.id "
+            "WHERE b.id IS NULL"
+        ).collect()
+        assert sorted(row[0] for row in rows) == [0, 6, 7, 8, 9, 10, 11]
+
+    def test_the_null_padded_side_is_not_pruned(self, session: Session) -> None:
+        frame = session.sql(
+            "SELECT a.id FROM fx.plain AS a "
+            "LEFT JOIN fx.partitioned AS b ON a.id = b.id "
+            "WHERE b.id IS NULL"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        padded = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert padded.pushed_filter is None
+        assert padded.files_scanned == 3
+
+    def test_a_null_rejecting_conjunct_still_prunes_the_padded_side(self, session: Session) -> None:
+        """Only the conjuncts a row of NULLs could satisfy are held back.
+
+        `b.as_at_date = '2026-08-16'` cannot be true of a manufactured NULL row, so it
+        prunes as it always did -- the fix costs nothing on the ordinary outer join.
+        """
+        frame = session.sql(
+            "SELECT a.id FROM fx.plain AS a "
+            "LEFT JOIN fx.partitioned AS b ON a.id = b.id "
+            "WHERE b.as_at_date = '2026-08-16'"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        padded = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert padded.pushed_filter is not None
+        assert padded.files_scanned == 1
+
+    def test_an_inner_join_answers_correctly_but_prunes_nothing(self, session: Session) -> None:
+        """Measured, and a pruning gap rather than a wrong answer.
+
+        `pushdown_predicates` folds a WHERE conjunct into an **inner** join's ON clause,
+        and the extractor reads only the scope's WHERE -- so the filter is applied by
+        DuckDB and prunes no files. The same query as a LEFT JOIN keeps the conjunct in
+        WHERE and prunes to one file, which is the test above. Reading the ON clause too
+        is Phase 10 work; recorded so the difference is not mistaken for the fix on this
+        page. FINDINGS.md §3.7.
+        """
+        frame = session.sql(
+            "SELECT a.id FROM fx.plain AS a "
+            "INNER JOIN fx.partitioned AS b ON a.id = b.id "
+            "WHERE b.as_at_date = '2026-08-16'"
+        )
+        assert sorted(row[0] for row in frame.collect()) == [4, 5]
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        inner = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert inner.pushed_filter is None
+        assert inner.files_scanned == 3

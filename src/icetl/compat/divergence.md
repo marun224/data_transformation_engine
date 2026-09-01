@@ -209,6 +209,7 @@ silent wrong answer if unhandled, which is why each has a fixture rather than a 
 | Unaliased projection names | sqlglot's `qualify` renames `sum(amount)` to `_col_0`. The optimized plan is adopted only if its output columns can be re-aliased to the names analysis already computed; otherwise the unoptimized plan runs instead | ✅ |
 | Identifier case in the optimizer | the optimizer runs in DuckDB's dialect, which is case-insensitive, so `VendorID` is normalised internally. Output names are restored from the analysed schema, so the user-visible spelling is unaffected | ✅ |
 | Nullability | the analysed schema comes from DuckDB, which has no non-nullable expression, so every field reports `nullable = true` even where Iceberg marked it required | ⚠️ |
+| `WHERE b.c IS NULL` over an outer join's null-padded side | the conjunct is **not** pushed to Iceberg. A row of NULLs there is manufactured by the join, not read from the table, so pushing it pruned away exactly the files that make an anti-join right and the query returned every left row instead of none. Only conjuncts a row of NULLs could not satisfy are pushed into a null-padded table; `WHERE b.date = X` still prunes. The one exception to “pruning is only ever a way to read less” — FINDINGS.md §1.10 | ✅ |
 | `CASE ... WHEN TRUE THEN v ...` | sqlglot 30.17's `simplify` folds a `CASE` whose always-true branch is **not the first** down to that branch's value, discarding every branch before it — `CASE WHEN a = 1 THEN 'one' WHEN TRUE THEN 'rest' END` becomes `'rest'`. DuckDB answers `'one'`, so it is a silent wrong answer rather than a missed optimisation. The plan is normalised before the rules run — an always-true branch becomes the `ELSE` and what follows it is dropped, which no reachable row can tell apart — so `simplify` never meets the shape. Found in Phase 8 | ✅ |
 
 ## Single-node divergences — Phase 4
@@ -289,6 +290,44 @@ that will fail when it lifts:
 |---|---|
 | **No streaming writes** | PyIceberg 0.11.1's `Transaction.append` opens `if not isinstance(df, pa.Table): raise ValueError`, so batches and readers are refused and the whole result is materialised. Chunking into several appends would trade atomicity for it, which is the worse deal |
 | **An overwrite is two snapshots** | A `delete` then an `append`, which is how Iceberg models replacing rows — so "one snapshot per write" holds only for appends. Both land in **one transaction**, so no reader sees the table mid-overwrite; the atomicity the goal was after does hold |
+
+## Schema, DDL and snapshots — Phase 9
+
+| Behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `CREATE TABLE t (c T NOT NULL)` | the column is required | required — the schema is built as Arrow and the column marked non-nullable before PyIceberg sees it, rather than going through the writer, which cannot say it | ✅ |
+| A table created by a **write** | nullability inferred | every field optional, as recorded under Phase 7. `catalog.listColumns` reports the difference honestly | ⚠️ |
+| `CREATE OR REPLACE TABLE` | keeps the table and adds a snapshot, so time travel survives the replace | **drops and rebuilds**, so the snapshot history goes with it. The data outcome is the same; the history is not | ⚠️ |
+| `ALTER TABLE ... ALTER COLUMN c TYPE t` | widening promotions | **refused** — Iceberg allows only widening, and PyIceberg 0.11 exposes no type update, so doing it here would mean rewriting every file | ⚠️ |
+| `ALTER TABLE ... ADD COLUMN c T NOT NULL` | refused | refused — existing rows would have no value for it | ✅ |
+| `UPDATE t SET s.field = v` | rewrites the one struct field | **refused**; rebuild the struct with `named_struct(...)`. Needs the schema-aware `withField` machinery on the SQL surface | 📋 later |
+| `catalog.cacheTable` / `uncacheTable` / `isCached` | caches by table name | **refused**, pointing at `frame.cache()`. Caching here is per-frame and eager; a name-level cache would have to shadow the table for both surfaces and go stale behind a write | ⚠️ |
+| Global temporary views | shared across sessions | **refused** — there is one session, so there is no one to share with | ⚠️ |
+| `catalog.recoverPartitions` | re-scans the filesystem for directories the metastore does not know about | **accepted and does nothing** — Iceberg tracks files in manifests, so there is no gap to recover. It checks the table exists and returns | ⚠️ |
+| `listTables().tableType` | `MANAGED` / `EXTERNAL` / `VIEW` / `TEMPORARY` | `MANAGED` for a catalog table, `TEMPORARY` for a view. The catalog holds the metadata pointer and a `DROP` removes it, which is what `MANAGED` means | ⚠️ |
+| `listColumns().isBucket` | Hive bucketing | always `false`. An Iceberg `bucket(n, c)` is a *partition* transform and is reported through `isPartition` | ⚠️ |
+| `listFunctions()` | the catalog's functions | the `F.*` surface — which is **not** yet what `Session.sql()` resolves. See the surface divergences below; decision 16 | ⚠️ |
+| A namespace whose name contains a dot | addressable | **not addressable** — nested Iceberg namespaces are joined with dots, so `nyc.raw` is two levels and a literal dot cannot be told apart | ⚠️ |
+| Time travel and the **schema** | reads the snapshot's own schema | reads the **current** schema, which is what PyIceberg's own scan does. It differs only where the schema changed after the snapshot: a renamed column still resolves through the §3.4 reconciliation, an added one reads NULL, a dropped one is not selectable | ⚠️ |
+| `VERSION AS OF n` | a snapshot id, for an Iceberg table | a snapshot id | ✅ |
+| `TIMESTAMP AS OF t` | the newest snapshot at or before `t` | the same; a time before the first snapshot is refused rather than answered empty | ✅ |
+| Writing to a snapshot | refused | refused for `DELETE`, `UPDATE`, `MERGE` and DDL. `INSERT INTO t VERSION AS OF ...` does not parse at all, so that one is closed earlier and by sqlglot | ✅ |
+| Metadata tables (`t.snapshots`, `t.files`, …) | computed on demand | **materialised at plan time** — there are no data files to prune and no predicate to push down, so the rows are read when the frame is built. A frame therefore holds the metadata as it was then | ⚠️ |
+| `mergeSchema` on write | adds the columns the frame has | the same, and **additive only**: a column the table has and the frame lacks is untouched and lands NULL | ✅ |
+
+### Two notes on the implementation
+
+**A timestamp is relabelled on the way in.** DuckDB stamps a `TIMESTAMP WITH TIME ZONE`
+with the session's own zone and Iceberg's `timestamptz` is UTC by definition, so
+`writer.iceberg_ready` retypes it — zone to UTC, nanoseconds to microseconds — before the
+table is created or written to. It moves no value: both sides are instants. Without it,
+creating a table from a frame carrying a timestamp column was impossible, and had been
+since Phase 7 (FINDINGS.md §2.7).
+
+**PyIceberg's schema mismatches are translated.** A required field given a NULL, a column
+the table does not have, a type that will not fit — PyIceberg reports each as a bare
+`ValueError`. `commit_with_retry` re-raises it as `AnalysisException`, keeping PyIceberg's
+own message, so a caller catching this engine's hierarchy hears about it.
 
 ## Row-level operations — Phase 8
 

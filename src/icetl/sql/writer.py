@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from icetl.catalog.resolver import TableRef
     from icetl.sql.dataframe import DataFrame
 
-__all__ = ["DataFrameWriter", "commit_with_retry"]
+__all__ = ["DataFrameWriter", "commit_with_retry", "iceberg_ready"]
 
 #: The reference's save modes, and the spellings it accepts for each.
 _MODES = {
@@ -234,6 +234,8 @@ class DataFrameWriter:
                 return
 
         table = catalog.load_table(ref.identifier)
+        if self._merges_schema():
+            table = self._merge_schema(catalog, ref, table)
         data = self._arrow_for(table, name, positional=insert_into)
         if overwrite:
             self._overwrite(table, data)
@@ -248,7 +250,7 @@ class DataFrameWriter:
         as-is: it knows how to turn one into an Iceberg schema, and doing it here would
         be a second type mapping to keep in step with the first.
         """
-        data = self._df.toArrow()
+        data = iceberg_ready(self._df.toArrow())
         # Best effort: some catalogs manage namespaces themselves and refuse to be told
         # about them, which is not a reason to fail the write.
         with contextlib.suppress(Exception):
@@ -307,6 +309,40 @@ class DataFrameWriter:
             return
         commit_with_retry(lambda: table.overwrite(data))
 
+    def _merges_schema(self) -> bool:
+        """True when `mergeSchema` asks for the table to be widened to fit the frame."""
+        for key, value in self._options.items():
+            if key.split(".")[-1].lower() != "mergeschema":
+                continue
+            setting = value.strip().lower()
+            if setting not in ("true", "false"):
+                raise EngineValueError(f"mergeSchema must be true or false, got {value!r}.")
+            return setting == "true"
+        return False
+
+    def _merge_schema(self, catalog: Catalog, ref: TableRef, table: Table) -> Table:
+        """Add the columns the frame has and the table does not, then reload it.
+
+        Only ever **additive**: `union_by_name` adds what is missing and never drops or
+        retypes what is there, which is what the reference's `mergeSchema` promises. A
+        column the table has and the frame does not is untouched and lands NULL.
+
+        A merge that changes nothing still costs a metadata read, which is why it is off
+        unless asked for -- and why an ordinary write that does not fit still fails
+        loudly rather than quietly reshaping the table.
+        """
+        incoming = iceberg_ready(self._df.toArrow()).schema
+        existing = {field.name for field in table.schema().fields}
+        missing = [field for field in incoming if field.name not in existing]
+        if not missing:
+            return table
+        import pyarrow as arrow
+
+        with table.update_schema() as update:
+            update.union_by_name(arrow.schema(missing))
+        self._df._session._invalidate_source(ref)
+        return catalog.load_table(ref.identifier)
+
     def _dynamic_partitions(self) -> bool:
         """True when `partitionOverwriteMode` asks for a per-partition overwrite.
 
@@ -328,7 +364,7 @@ class DataFrameWriter:
 
     def _arrow_for(self, table: Table, name: str, *, positional: bool) -> pa.Table:
         """The rows to write, checked against the table they are going into."""
-        data = self._df.toArrow()
+        data = iceberg_ready(self._df.toArrow())
         expected = [field.name for field in table.schema().fields]
         if positional:
             if len(data.schema.names) != len(expected):
@@ -341,6 +377,48 @@ class DataFrameWriter:
             # to match the names would make the method the one it is not.
             data = data.rename_columns(expected)
         return data
+
+
+def iceberg_ready(data: pa.Table) -> pa.Table:
+    """Retype the timestamp columns to something Iceberg will accept.
+
+    DuckDB stamps a `TIMESTAMP WITH TIME ZONE` with the **session's own** zone --
+    `timestamp[us, tz=Asia/Calcutta]` on the machine this was found on -- and Iceberg's
+    `timestamptz` is UTC by definition, so PyIceberg refuses anything else outright:
+    *Column 'ts' has an unsupported type*. Nanoseconds are refused for the same reason,
+    Iceberg storing microseconds.
+
+    Neither is a conversion of the data. A zone-aware Arrow timestamp is an instant, and
+    so is Iceberg's, so this rewrites the label and leaves every value where it was. It
+    runs on the way *into* Iceberg only -- what comes back out is untouched.
+
+    Reaching this at all needs a timestamp column, which no `fx.*` fixture had until
+    Phase 9 added one; `saveAsTable` had been unable to create a table from a frame
+    carrying one since Phase 7.
+    """
+    import pyarrow as arrow
+
+    fields = list(data.schema)
+    changed = False
+    for index, field in enumerate(fields):
+        replacement = _iceberg_timestamp(field.type, arrow)
+        if replacement is not None:
+            fields[index] = field.with_type(replacement)
+            changed = True
+    if not changed:
+        return data
+    return data.cast(arrow.schema(fields, metadata=data.schema.metadata))
+
+
+def _iceberg_timestamp(field_type: Any, arrow: Any) -> Any | None:
+    """The type Iceberg wants for `field_type`, or None when it is already fine."""
+    if not arrow.types.is_timestamp(field_type):
+        return None
+    unit = "us" if field_type.unit == "ns" else field_type.unit
+    zone = "UTC" if field_type.tz is not None else None
+    if unit == field_type.unit and zone == field_type.tz:
+        return None
+    return arrow.timestamp(unit, tz=zone)
 
 
 def _names(method: str, cols: tuple[Any, ...]) -> list[str]:
@@ -373,3 +451,11 @@ def commit_with_retry(operation: Callable[[], None]) -> None:
             if attempt == _COMMIT_ATTEMPTS - 1:
                 raise
             time.sleep(_COMMIT_BACKOFF_SECONDS * (2**attempt))
+        except ValueError as exc:
+            # PyIceberg validates the incoming schema against the table's and reports a
+            # mismatch as a bare `ValueError` -- a required field given a NULL, a column
+            # the table does not have, a type that will not fit. Every one of those is
+            # an analysis failure in this engine's vocabulary, and a caller that catches
+            # `AnalysisException` should not have to also catch `ValueError` to hear
+            # about it. The message is PyIceberg's own, which is the useful part.
+            raise AnalysisException(str(exc)) from exc

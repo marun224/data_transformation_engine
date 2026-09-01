@@ -23,14 +23,16 @@ dependency turned out to be wrong is in [FINDINGS.md](FINDINGS.md).
 
 ## Status
 
-**Phases 0–8 complete** — the read side, writing back, and changing rows in place.
-Config and catalog resolution, the DataFrame and SQL surfaces, the plan IR with predicate
-and projection pushdown, a 314-name function library, relational breadth (joins,
-`groupBy().agg()`, grouping sets, set operations, ordering, `na.*`/`stat.*`, caching,
-temporary views), window functions, complex types, the write path — `df.write`,
-`insertInto`, SQL `INSERT`, partitioned creation and dynamic partition overwrite — and
-row-level `DELETE`, `UPDATE` and `MERGE`, the last with the full Spark merge grammar and
-all copy-on-write. Phase 9 adds schema, DDL and snapshots. See [STATUS.md](STATUS.md).
+**Phases 0–9 complete** — the read side, writing back, changing rows in place, and the
+catalog itself. Config and catalog resolution, the DataFrame and SQL surfaces, the plan IR
+with predicate and projection pushdown, a 314-name function library, relational breadth
+(joins, `groupBy().agg()`, grouping sets, set operations, ordering, `na.*`/`stat.*`,
+caching, temporary views), window functions, complex types, the write path — `df.write`,
+`insertInto`, SQL `INSERT`, partitioned creation and dynamic partition overwrite —
+row-level `DELETE`, `UPDATE` and `MERGE` with the full Spark merge grammar, and now
+`session.catalog.*`, SQL DDL with partition and sort-order evolution, `mergeSchema`, time
+travel (`VERSION AS OF` / `TIMESTAMP AS OF`) and Iceberg's metadata tables. Phase 10 adds
+performance and scale. See [STATUS.md](STATUS.md).
 
 ## Setup
 
