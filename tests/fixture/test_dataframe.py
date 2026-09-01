@@ -421,12 +421,18 @@ class TestEmptyTable:
 
 
 class TestDeferredSurface:
-    @pytest.mark.parametrize("attribute", ["write", "rdd"])
+    @pytest.mark.parametrize("attribute", ["rdd"])
     def test_later_phases_name_themselves(self, session: Session, attribute: str) -> None:
         df = session.table("fx.plain")
         with pytest.raises(UnsupportedFeatureError):
             getattr(df, attribute)
 
-    def test_print_schema_level_is_deferred(self, session: Session) -> None:
-        with pytest.raises(UnsupportedFeatureError):
-            session.table("fx.plain").printSchema(level=2)
+    def test_write_arrived_in_phase_7(self, session: Session) -> None:
+        """It raised `phase="Phase 7"` until the write path landed; see test_write."""
+        from icetl.sql.writer import DataFrameWriter
+
+        assert isinstance(session.table("fx.plain").write, DataFrameWriter)
+
+    def test_print_schema_takes_a_level_since_phase_6(self, session: Session) -> None:
+        """Deferred until there were nested schemas worth truncating; see test_complex_types."""
+        session.table("fx.plain").printSchema(level=2)

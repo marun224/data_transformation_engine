@@ -20,7 +20,7 @@ effects, both recorded in `compat/divergence.md`:
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import pyarrow as pa
@@ -159,6 +159,20 @@ class PlanAnalyzer:
         arrow_schema = source.resolved.table.schema().as_arrow()
         self.connection.register(source.view, arrow_schema.empty_table())
         self._registered.add(source.view)
+
+    def register_view(self, name: str, value: Any) -> None:
+        """Register an arbitrary relation under `name`, replacing any existing one.
+
+        `register` above is for scan sources; this is for the frames a session
+        materialises, whose schema comes from the data rather than from a catalog.
+        """
+        self.connection.register(name, value)
+        self._registered.add(name)
+
+    def unregister_view(self, name: str) -> None:
+        if name in self._registered:
+            self.connection.unregister(name)
+            self._registered.discard(name)
 
     def analyze(self, sql: str, sources: Mapping[str, ScanSource]) -> StructType:
         """Return the output schema of `sql`, or raise `AnalysisException`.

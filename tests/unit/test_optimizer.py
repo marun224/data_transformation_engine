@@ -134,18 +134,57 @@ class TestFallback:
 
 
 class TestUnions:
-    def test_a_union_is_optimized_only_when_its_names_already_match(self) -> None:
-        """A UNION's output names come from its first branch several levels down.
-        Rather than reach in and rewrite that, the pipeline declines."""
+    """Carry-over note 10, closed: a set operation is renamed through its first branch.
+
+    A set operation's output names come from its leftmost branch alone, however deeply
+    nested. Until Phase 4 the pipeline declined to reach in and rewrite that, which cost
+    far more than the rename -- `_restore_output_names` returning None discards the
+    *whole* optimization, so predicate and projection pushdown went with it.
+    """
+
+    def test_a_union_whose_names_already_match_is_optimized(self) -> None:
         plan = parse('SELECT "id" FROM "fx"."plain" UNION ALL SELECT "id" FROM "fx"."plain"')
         result = optimize_plan(plan, SCHEMA, ["id"])
+        assert result.applied
         assert names(result.optimized) == ["id"]
 
-    def test_a_union_needing_a_rename_is_discarded(self) -> None:
+    def test_a_union_needing_a_rename_is_now_renamed_and_kept(self) -> None:
         plan = parse(
             'SELECT "amount" + 1 FROM "fx"."plain" UNION ALL SELECT "amount" FROM "fx"."plain"'
         )
         result = optimize_plan(plan, SCHEMA, ["(amount + 1)"])
+        assert result.applied
+        assert names(result.optimized) == ["(amount + 1)"]
+
+    def test_only_the_first_branch_is_renamed(self) -> None:
+        """The other branches match positionally; their own names are never read."""
+        plan = parse(
+            'SELECT "amount" + 1 FROM "fx"."plain" UNION ALL SELECT "amount" FROM "fx"."plain"'
+        )
+        result = optimize_plan(plan, SCHEMA, ["(amount + 1)"])
+        assert isinstance(result.optimized, exp.SetOperation)
+        assert names(result.optimized.expression) != ["(amount + 1)"]
+
+    def test_a_three_branch_union_is_renamed_through_the_leftmost(self) -> None:
+        """`A UNION B UNION C` parses left-heavy, so the naming branch is two levels down."""
+        branch = 'SELECT "amount" FROM "fx"."plain"'
+        plan = parse(f'SELECT "amount" + 1 FROM "fx"."plain" UNION ALL {branch} UNION ALL {branch}')
+        result = optimize_plan(plan, SCHEMA, ["(amount + 1)"])
+        assert result.applied
+        assert names(result.optimized) == ["(amount + 1)"]
+
+    def test_an_intersect_is_renamed_the_same_way(self) -> None:
+        plan = parse(
+            'SELECT "amount" + 1 FROM "fx"."plain" INTERSECT SELECT "amount" FROM "fx"."plain"'
+        )
+        result = optimize_plan(plan, SCHEMA, ["(amount + 1)"])
+        assert result.applied
+        assert names(result.optimized) == ["(amount + 1)"]
+
+    def test_a_mismatched_column_count_is_still_declined(self) -> None:
+        """The length check is the assertion that positional re-aliasing is sound."""
+        plan = parse('SELECT "id" FROM "fx"."plain" UNION ALL SELECT "id" FROM "fx"."plain"')
+        result = optimize_plan(plan, SCHEMA, ["id", "surplus"])
         assert not result.applied
 
 
@@ -178,3 +217,38 @@ class TestArithmeticInsideARule:
         plan = parse('SELECT 1 / 0 AS "v" FROM "fx"."plain"')
         result = optimize_plan(plan, SCHEMA, ["v"])
         assert result.applied
+
+
+class TestAlwaysTrueCaseBranches:
+    """A `CASE` whose always-true branch is not the first one (Phase 8).
+
+    sqlglot 30.17's `simplify` folds that shape down to the always-true branch's value
+    and discards every branch before it -- a wrong answer, and a silent one. The plan is
+    normalised before the rules run so `simplify` never meets the case it mishandles.
+    """
+
+    def optimized(self, sql: str) -> str:
+        plan = parse(sql)
+        result = optimize_plan(plan, SCHEMA, names(plan))
+        return result.optimized.sql(dialect="duckdb")
+
+    def test_the_branches_before_it_survive(self) -> None:
+        sql = (
+            "SELECT CASE WHEN id = 1 THEN 'one' WHEN id <= 2 THEN 'two' "
+            "WHEN TRUE THEN 'rest' END AS v FROM fx.plain"
+        )
+        optimized = self.optimized(sql)
+        assert "'one'" in optimized
+        assert "'two'" in optimized
+        assert "ELSE 'rest'" in optimized
+
+    def test_a_leading_always_true_branch_is_the_whole_answer(self) -> None:
+        optimized = self.optimized("SELECT CASE WHEN TRUE THEN 'a' ELSE 'b' END AS v FROM fx.plain")
+        assert "'b'" not in optimized
+
+    def test_an_operand_case_is_left_alone(self) -> None:
+        """`CASE x WHEN TRUE THEN ...` compares `x` to TRUE; it is not always true."""
+        optimized = self.optimized(
+            "SELECT CASE vendor WHEN 'a' THEN 1 WHEN TRUE THEN 2 ELSE 3 END AS v FROM fx.plain"
+        )
+        assert "CASE" in optimized

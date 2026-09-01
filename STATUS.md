@@ -7,19 +7,18 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-08-30, part-way through Phase 4 — aggregation and joins are in,
-set operations are next.
+**Paused:** 2026-09-01, at the end of Phase 8. Phase 9 (schema, DDL, snapshots) is next
+and is not started.
 
 ### Where things stand
 
 | | |
 |---|---|
-| Phases 0, 1, 2, 3 | **done**, green |
-| Phase 4 | **in progress** — `groupBy().agg()` ✅ and joins ✅ done; set ops, `distinct`, `orderBy`, `na.*`/`stat.*`, temp views still to do |
+| Phases 0–8 | **done**, green |
 | Phases 12, 13, 14, 15 | **deferred by decision**, each with its own section in PLAN.md §4 |
 | ⚠️ Live gap | `weekday`/`dayofweek` are off by one through `Session.sql()` — **use `F.*` for date parts** until Phase 15 |
 | Decision 15 | **done** — the PySpark compat surface is removed; see the section below |
-| Tests | 882 local, 11 integration |
+| Tests | 1302 local, 11 integration |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
 
 ### Committed
@@ -28,8 +27,12 @@ set operations are next.
 |---|---|
 | `92efdb8` | *"Initial commit: icetl through Phase 3 (in progress)"* — 85 files, 16,408 lines |
 | `26c792d` | *"code refactoring"* — 66 files, +5,649/−1,460. Phase 3's completion (the third `F.*` tranche, the optimizer's `ArithmeticError` fix), decision 15's rename, `tox.ini`, and the notebooks |
+| `dcb2739` | *"phase 4 chnages are committed"* — `groupBy().agg()` and joins |
 
-The working tree is clean as of this note.
+> ⚠️ **Nothing after `dcb2739` is committed.** The rest of Phase 4 and the whole of
+> Phases 5, 6, 7 and 8 exist only in the working tree — Phases 4–7 staged in the index,
+> Phase 8 on top of them and not yet added. That is four phases of work in one place.
+> `git status` first; committing it is the first thing to do.
 
 ### Picking it back up
 
@@ -39,8 +42,8 @@ gitignored; `.env.example` documents every key. Local tests need neither.
 
 ```bash
 uv sync --extra dev            # if the venv is cold
-uv run tox                     # the whole gate: lint, mypy, 882 tests, then dist/
-uv run pytest -q               # 882 expected, if you want just the tests
+uv run tox                     # the whole gate: lint, mypy, 1302 tests, then dist/
+uv run pytest -q               # 1302 expected, if you want just the tests
 uv run pytest -m integration -q # 11 expected; needs the catalog up
 uv run ruff check . && uv run ruff format --check . && uv run mypy .
 uv run python scripts/smoke_catalog.py -v   # proof of life against the real catalog
@@ -48,15 +51,31 @@ uv run python scripts/smoke_catalog.py -v   # proof of life against the real cat
 
 ### The next thing to do
 
-**Phase 4 is under way.** `groupBy().agg()` and joins are done and green — see the
-Phase 4 section below for what each covers. **Next: set operations** (`union`,
-`unionByName`, `intersect`, `exceptAll`, `subtract`), where carry-over note 10 is waiting:
-the optimizer declines to rewrite a `UNION` whose output names need restoring, so set
-operations currently get no pushdown at all.
+**Phases 4 through 8 are complete.** The read side is finished, data can be written
+back, and rows can be changed in place: `df.write`, `insertInto`, SQL `INSERT`, and now
+`DELETE`, `UPDATE` and `MERGE` — the full Spark merge grammar — all copy-on-write.
 
-After that: `distinct`/`dropDuplicates`, `orderBy`/`sort`, `rollup`/`cube`/`pivot`,
-`na.*` and `stat.*`, and the SQL side (CTEs, `EXISTS`, temp views). PLAN.md §4 has the
-full list.
+**Next: Phase 9 — schema, DDL, snapshots.** `spark.catalog.*`, `CREATE`/`ALTER`/`DROP
+TABLE`, partition-spec and sort-order evolution, `mergeSchema` on write, time travel and
+the metadata tables. `Session.sql()` still raises `phase="Phase 9"` for `CREATE`, `DROP`
+and `ALTER`, which is the list of what to implement.
+
+Three things from Phase 8 to carry into it:
+
+- **Nested-field assignment is waiting on Phase 9.** `UPDATE t SET s.field = v` is
+  refused today. Phase 6 built the schema-aware `withField` machinery for the DataFrame
+  surface; making it reachable from SQL is the same job as `ALTER TABLE ... ALTER
+  COLUMN`, so do them together.
+- **Two languages, one set of nodes.** `plan/pushdown.scope_predicate` returns the
+  PyIceberg predicate *and* the sqlglot conjuncts it came from, so a caller needing both
+  cannot let them drift. Anything in Phase 9 that deletes by predicate wants that, not a
+  second translation.
+- **`_invalidate_source` still.** Any operation that changes a table must call it.
+  Schema changes need it too, and harder — a cached `ScanSource` pins the *schema id* as
+  well as the snapshot.
+
+PLAN.md §4 has the full phase list, and [FINDINGS.md](FINDINGS.md) has every trap found so
+far — worth ten minutes before writing anything that generates SQL.
 
 The SQL-surface function gap found at the end of Phase 3 is **deferred to Phase 15**
 (decision 16) — it is documented, not forgotten. One thing to carry while working:
@@ -474,12 +493,12 @@ deletion regressed nothing — and nothing ever proved the zero-edit promise wor
 
 ---
 
-## Phase 4 — Relational breadth · **IN PROGRESS** (2026-08-30)
+## Phase 4 — Relational breadth · **DONE** (2026-08-31)
 
-Green on: `uv run tox` (lint · mypy · 882 tests against the built wheel · dist) and
+Green on: `uv run tox` (lint · mypy · 1072 tests against the built wheel · dist) and
 `uv run pytest -m integration` (11 passed).
 
-Two of Phase 4's pieces are done. Test count went 821 → 882.
+Test count went 821 → 882 → 922 → 1024 → 1072 across the phase.
 
 ### `groupBy().agg()` — done
 
@@ -554,20 +573,620 @@ keeps both called `id` and *raises* on a later `df["id"]` as ambiguous. Ours nam
   is now a `_from_clause` companion beside it so the next reader finds the accessor
   rather than the key.
 
-### Still to do in Phase 4
+### Set operations — done (2026-08-31)
 
-Set operations (`union`, `unionByName` incl. `allowMissingColumns`, `intersect`,
-`exceptAll`, `subtract`) — **next**, and carry-over note 10 lives here ·
-`distinct`/`dropDuplicates` · `orderBy`/`sort` · `sample`/`randomSplit` ·
-`repartition` (no-op) · `cache`/`persist` → DuckDB temp table · `rollup`/`cube`/`pivot` ·
-`na.fill/drop/replace` · `stat.*` (`approxQuantile`, `corr`, `cov`, `crosstab`,
-`freqItems`) · SQL side: CTEs, subqueries, `EXISTS`, temp views · and the `F.*`
-leftovers `grouping`, `grouping_id`, `broadcast`.
+**Built:** `DataFrame.union` / `unionAll` / `unionByName` / `intersect` / `intersectAll` /
+`exceptAll` / `subtract`, driven by one `_SET_OPERATIONS` table, plus `_as_set_branch`
+for the nesting rules below. 36 tests in `tests/fixture/test_setops.py`.
+
+| Method | SQL | De-duplicates |
+|---|---|---|
+| `union` / `unionAll` | `UNION ALL` | **no** |
+| `unionByName` | `UNION ALL`, re-projected | **no** |
+| `intersect` | `INTERSECT` | yes |
+| `intersectAll` | `INTERSECT ALL` | no |
+| `subtract` | `EXCEPT` | yes |
+| `exceptAll` | `EXCEPT ALL` | no |
+
+DuckDB's multiset and NULL semantics were checked against the reference before building
+and agree on every point: `EXCEPT ALL` subtracts multiplicities (3 minus 1 leaves 2),
+`INTERSECT ALL` keeps the smaller (min of 3 and 2 is 2), and both `INTERSECT` and `EXCEPT`
+match **NULL to NULL** where `=` would not. So no conformance layer was needed here.
+
+**One line of the SQL surface came free.** `INTERSECT` and `EXCEPT` had been rejected as
+*"not implemented, scheduled for Phase 4"* — but only because `Session.sql()`'s allowlist
+named `exp.Union` rather than its parent `exp.SetOperation`. sqlglot parsed them and
+DuckDB ran them correctly the whole time. Widening the isinstance check was the entire fix.
+
+**The nesting rule is a correctness guard, not tidiness.** DuckDB binds `INTERSECT`
+tighter than `UNION ALL`, so an inlined `a.union(b).intersect(c)` evaluates
+`a UNION ALL (b INTERSECT c)` — a different query that raises nothing and answers wrongly.
+Measured before the guard existed: the flat spelling returned 2 rows where the intended
+grouping returns 1. `_as_set_branch` therefore nests any branch that is itself a set
+operation, and any branch carrying LIMIT/OFFSET/ORDER BY (those bind to the whole set
+operation, and DuckDB will not even parse them mid-branch).
+
+**`union` matches by position, and that is the reference's behaviour, not a shortcut.**
+Two frames carrying the same names in a different order union into nonsense without
+complaint — and the widening makes it worse rather than louder: `bigint` over `string`
+settles on `string`, so an `id` of `1` comes back as `'1'`. `test_union_matches_by_
+position_not_by_name` pins the trap deliberately. `unionByName` is the safe spelling.
+
+**`unionByName` fills with a bare `NULL`, not a cast one.** A set operation takes each
+column's type from the branches that do have it, so DuckDB types a filled column from the
+other side and the two agree — no Spark-type-to-SQL-type mapping needed on this path.
+
+### Grouping sets and pivot — done (2026-08-31)
+
+**Built:** `DataFrame.rollup` / `cube`, `GroupedData.pivot`, and the three `F.*`
+leftovers `grouping`, `grouping_id`, `broadcast` (276 names now). 27 tests in
+`tests/fixture/test_grouping_sets.py`.
+
+`rollup` and `cube` are grouping *sets*: they go in their own `exp.Group` argument rather
+than in `expressions`, because a grouping set replaces the plain key list rather than
+accompanying one — putting the keys in both would group by them twice.
+
+**The trap they share is a wrong answer, not an error.** A rolled-up key comes back as
+NULL, and `fx.plain`'s `vendor` already contains a real NULL. So a rollup over it returns
+*two* rows whose vendor is NULL — the group of rows that had no vendor (total 50.0) and
+the grand total over every row (110.75) — and nothing in the values tells them apart.
+`F.grouping` is the only thing that does, which is why it landed in the same slice rather
+than being left as an `F.*` leftover.
+
+**`pivot` compiles to conditional aggregation**, not to DuckDB's `PIVOT` — that is a
+statement rather than an expression and would not compose with the rest of a plan. So
+`sum(v)` becomes `sum(CASE WHEN k IS NOT DISTINCT FROM 'x' THEN v END)`, which is how the
+reference compiles a pivot too. Three details fell out of doing it that way:
+
+- the match is **null-safe**, so a NULL pivot key gets its own column named `null` rather
+  than an empty one — a NULL key is a group, not an absence;
+- **every aggregate in the expression is rewritten**, not the expression as a whole, so a
+  composite like `sum(a) / count(b)` restricts both sides before dividing;
+- `count(*)` has no argument to restrict, so it counts a literal instead.
+
+`pivot` is **the one transformation that runs a query**: with `values` omitted the
+distinct values must be known before the projection can be written. That is what the
+reference does, for the same reason. Pass `values` to keep it lazy. A `pivotMaxValues`
+guard at 10,000 is carried for the reference's reason — a pivot on a high-cardinality
+column does not fail, it succeeds and returns thousands of columns.
+
+**A live bug found by using the new code.** `F.count(<Column>)` raised
+`EngineValueError` — `col == "*"` builds a comparison *expression*, not a bool, so the
+`or` guarding it reached `Column.__bool__`. Only the string spellings (`F.count("*")`,
+`F.count("amount")`) had tests, which is how 882 tests passed with it broken.
+`crosstab` was the first caller to pass a Column and found it immediately. Fixed by
+testing the type before the value; `TestCountAcceptsAColumn` covers all three spellings.
+
+### `na.*` and `stat.*` — done (2026-08-31)
+
+**Built:** `sql/na.py` (`DataFrameNaFunctions`) and `sql/stat.py`
+(`DataFrameStatFunctions`), plus `df.dropna` / `fillna` / `replace` as the frame-level
+spellings. 40 tests in `tests/fixture/test_na_stat.py`.
+
+**The type rule is the whole of `na`.** A fill value only touches columns it could
+plausibly belong to: `fill(0)` fills numeric columns and leaves a NULL string alone,
+`fill("?")` does the reverse, and `fill(True)` reaches neither here because `fx.plain`
+has no boolean. Getting that wrong is a wrong answer that a test on a numeric column
+alone would not catch, so every fill test asserts on the column that must **not** have
+changed as well as the one that must.
+
+Two smaller precedences, both the reference's and both spelled out where they live:
+`thresh` **overrides** `how` rather than combining with it, and a name in `subset` that
+the frame does not have is ignored (it is a filter over the columns) while a key in
+`fill`'s dict form that the frame does not have is refused (it can only be a mistake).
+
+For `stat`, the choices worth knowing:
+
+| Method | Choice |
+|---|---|
+| `approxQuantile` | `quantile_disc`, so `relativeError=0` returns an **observed value** rather than an interpolation — which is what the reference's quantiles are. Above zero, DuckDB's bound is fixed, so the answer may be more accurate than asked and never less |
+| `cov` | `covar_samp`, not `covar_pop` — the reference divides by `n-1`, and on a small frame the two differ by enough to matter |
+| `corr`, `cov` | a **non-numeric column is refused**. DuckDB would cast a date and answer; a number that means nothing is worse than an error |
+| `crosstab` | built on the new `pivot`. An absent pair counts **0**, not NULL — it is an observed zero, not a missing measurement — and NULL is labelled `null` on both axes so the row label matches the column header |
+| `freqItems` | **exact**, not a sketch: the reference approximates because it counts across a cluster, and one grouped scan per column is strictly inside the same contract. The result is folded into a **literal plan with no source**, so the frame is independent of the table it came from |
+
+### Sampling, caching, partitioning and temp views — done (2026-08-31)
+
+**Built:** `sample`, `randomSplit`, `cache`/`persist`/`unpersist`, `repartition`/
+`coalesce`, `createOrReplaceTempView`/`createTempView`, `Session.dropTempView`, and
+`Session._materialize`/`_release`. 35 tests in `tests/fixture/test_materialize.py`.
+
+Most of this group has less to do than the names suggest, because the reference is a
+distributed engine and this is not: `repartition` and `coalesce` are no-ops with
+docstrings, and so is `F.broadcast`. They exist so a script written against the reference
+runs unaltered. The three that carry real work:
+
+**`cache` registers with *both* DuckDB connections, and that is the design.** Execution
+and analysis run on deliberately separate connections — the analyzer never loads httpfs,
+never sees a credential and never opens a file — so a temp table created for execution is
+invisible to schema resolution. The engine gets the real rows; the analyzer gets a
+zero-row view of the same Arrow schema. Without that, a cached frame would `collect()`
+fine and fail the moment you tried to `select` from it, which is the case
+`test_a_cached_frame_can_still_be_transformed` exists to hold down.
+
+`cache` is **eager** and returns a **new** frame rather than `self`. Nothing here mutates
+a plan in place, so the reference's lazy mark would have nowhere to live. Recorded in
+`divergence.md`; the consequence is that `df.cache()` on its own caches nothing reachable.
+
+**`randomSplit` materialises first, and must.** Each split is a filter over one random
+number per row, so those numbers have to be the *same* numbers every time a split is
+collected — otherwise a row lands in two splits or in none, and nothing about the result
+looks wrong. Drawing once into a temp table is what makes the splits disjoint and
+complete. The tests assert on membership rather than on sizes, since sizes are the part
+allowed to vary.
+
+**`sample` refuses `withReplacement=True`** rather than approximating it. DuckDB draws
+each row at most once; quietly handing a without-replacement sample to a caller who asked
+for the other is a wrong answer. `sample` also joined `_POST_FILTER_CLAUSES`, because
+`USING SAMPLE` draws from what the FROM and WHERE produced — merging a later filter into
+a sampled SELECT would filter *before* the draw instead of after it.
+
+**A temp view is a plan, not rows.** `_inline_temp_views` substitutes the registered plan
+before source keys are collected, so the optimizer, pushdown and the scan planner never
+learn that views exist — and a query through a view still prunes to 1 of 3 files. CTE
+names are skipped, so `WITH v AS (...)` shadows a view called `v` rather than colliding
+with it.
+
+`CREATE VIEW` through `Session.sql()` is still Phase 9, but it no longer says only
+*"scheduled for Phase 9"* — that sent people away from `createOrReplaceTempView`, which
+works today. The message now names it.
+
+### De-duplication, ordering and local data — done (2026-08-31)
+
+**Built:** `distinct` / `dropDuplicates` / `drop_duplicates`, `orderBy` / `sort` /
+`sortWithinPartitions`, `Session.createDataFrame` and `Session.range`. 48 tests in
+`tests/fixture/test_order_local.py`. These four are what closed the phase.
+
+**`orderBy` spells no null placement, deliberately.** `_fix_null_ordering` is a tree pass
+over every `exp.Ordered`, so a sort built here and one parsed from `Session.sql()` reach
+the same node and come out identical — nulls first ascending, last descending, on both
+surfaces. Putting the rule in `orderBy` too would give the two surfaces their own answers
+to the same question, which is exactly what P1 exists to prevent. `TestOrderingIsShared`
+checks that this is true rather than merely intended.
+
+**Two clause-precedence rules, both guarding wrong answers rather than errors.** SQL
+applies DISTINCT and ORDER BY *before* LIMIT, so folding either into a frame that has
+already taken a LIMIT changes which rows come back, silently:
+
+| Call | Correct | What merging would have given |
+|---|---|---|
+| `df.limit(3).orderBy("id", ascending=False)` | `[3, 2, 1]` — those three rows, sorted | `[5, 4, 3]` — the table sorted, then three taken |
+| `df.limit(3).distinct()` | 3 rows | the whole table de-duplicated, then three |
+
+So `_rebase_order` and `_rebase_distinct` nest past a LIMIT or OFFSET. A later `orderBy`
+with no limit in between still *replaces* the earlier one rather than stacking, which is
+the reference's behaviour.
+
+`dropDuplicates(subset)` compiles to DuckDB's `DISTINCT ON`. Which row survives is not
+defined — the reference does not promise one either, because on a partitioned engine it
+cannot — so the tests assert that the keys are unique afterwards, not which row carried
+them.
+
+**`Session.range` is lazy; `createDataFrame` is not.** A range is a DuckDB table
+*function*, so `collect_source_keys` skips it, nothing asks the catalog to resolve a
+table called `range`, and a billion-row range costs nothing until something reads it.
+`createDataFrame` goes through the same `_materialize` path as `cache()`, which is what
+makes the frame independent of the Python objects it came from — `test_the_frame_reads_
+no_table` clears the source list and still collects.
+
+A typed schema **casts** rather than reinterprets, so it obeys the same conformance rules
+as any other cast: `createDataFrame([("abc",), ("7",)], "n bigint")` gives NULL and 7, and
+raises under `icetl.ansiMode`. That fell out of reusing `Column.cast` rather than
+converting types by hand.
+
+**A bug the tests caught in my own code.** With a `names` list shorter than the data,
+the tuple path built the Arrow table *from the names* and silently dropped the extra
+column — so the width check downstream compared 1 against 1 and passed. Now the table is
+always built with the data's own column count and renamed afterwards, so a wrong-length
+`names` is caught instead of truncating the rows to fit.
+
+### Carry-over note 10 — measured, then closed (2026-08-31)
+
+The note as first written said set operations "get no pushdown". Measured on
+`fx.partitioned`, that was too broad: the loss was **conditional on the branch names**,
+and where it bit, it took everything rather than only the rename.
+
+| `SELECT … UNION ALL SELECT …` | Files | Columns | Pushed filters |
+|---|---|---|---|
+| `id` (names already match) | 2 of 3 | 2 of 3 | pushed |
+| `sum(amount)` — **before** | 3 of 3 | 3 of 3 | **none** |
+| `sum(amount)` — **after** | **2 of 3** | **2 of 3** | **pushed** |
+
+**Why it cost so much.** `qualify` renames an unaliased projection to `_col_0`, so the
+optimized plan has to be renamed back before it can be adopted. `_restore_output_names`
+declined for anything that was not a plain `exp.Select` — and declining means returning
+`None`, which discards the *whole* pipeline, not merely the re-aliasing. Predicate and
+projection pushdown went with it. The query still answered correctly; it just read every
+file and every column to do so, which is the kind of defect nothing fails on.
+
+**The fix, six lines.** A set operation's output names come from its **leftmost branch**,
+however deeply nested — `A UNION B UNION C` parses left-heavy, and the other branches
+match positionally with their own names never read. `_naming_branch` walks down to that
+one `Select` and the existing positional re-aliasing does the rest. The result is then
+re-checked against the expected names rather than assumed: a branch shape that did not
+take the rename is still declined, or the caller would be promised names the plan does
+not produce.
+
+Worth fixing rather than documenting, because the bad row was the ordinary one:
+`groupBy().agg(F.sum("amount"))` emits an unaliased `SUM(amount)`, so *any* set operation
+over an aggregate landed in it. `TestNoteTen` in `test_setops.py` now pins all four
+properties — plan adopted, name preserved, both predicates pushed, unused column pruned —
+and one more that matters more than any of them: that the answer is still right. Pruning
+that changed the answer would be the only outcome worse than not pruning.
 
 Carry-over note 11 (two references to one table merging into a single scan) is visible in
 the generated join SQL — both sides of a self-join read the same
 `$icetl_src_0_paths_0`. Correct, but a self-join with disjoint filters prunes less than
 it could.
+
+---
+
+## Phase 5 — Window functions · **DONE** (2026-08-31)
+
+Green on: `uv run tox` (lint · mypy · 1115 tests against the built wheel · dist) and
+`uv run pytest -m integration` (11 passed). Test count went 1072 → 1115.
+
+**Built:** `sql/window.py` (`Window`, `WindowSpec`), `Column.over()`, and twelve `F.*`
+names — `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`,
+`lead`, `nth_value`, `first_value`, `last_value`, `monotonically_increasing_id`. 288
+names now. 43 tests in `tests/fixture/test_window.py`.
+
+### The frame default is the whole phase
+
+PLAN.md called frame semantics "where Spark/DuckDB drift is likeliest". Probed before
+building, they **agree on every point** — which is the useful finding, because it means
+the conformance layer needed nothing. But the default frame is still the thing that will
+bite a caller, and it is not a divergence, it is SQL:
+
+| Query | Result on `x = 10, 20, 20, 40` |
+|---|---|
+| `sum(x).over(Window.orderBy("x"))` | `10, 50, 50, 90` |
+| the same, `.rowsBetween(unboundedPreceding, currentRow)` | `10, 30, 50, 90` |
+
+With an ordering and no explicit frame the default is
+`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, which includes every row **tying**
+with the current one — so a running total jumps over a tie rather than climbing through
+it. The two spellings agree on any column without duplicates, which is exactly what
+makes it easy to ship the wrong one. `TestFrameDefaults` pins both.
+
+The same shape produces the `last_value` surprise: over the default frame it returns the
+**current row**, not the last row of the partition, because the frame ends at the current
+row. SQL's rule, and the reference has it too. `first_value` looks right by coincidence —
+the frame's start really is the partition's start. Both are documented on the functions
+and tested side by side against the explicit unbounded frame.
+
+### Two things inherited rather than built
+
+- **Null ordering inside `OVER`.** `window.py` spells no null placement at all, and gets
+  the reference's anyway: `_fix_null_ordering` is a tree pass over every `exp.Ordered`,
+  and a window's ordering is made of the same nodes as a top-level one. Verified in the
+  generated SQL (`ORDER BY "vendor" NULLS FIRST`) and against `Session.sql()` (P1).
+- **Pushdown.** A window reads its whole partition, which is easy to mistake for reading
+  everything. It does not: `row_number() OVER (ORDER BY id)` on `fx.wide` reads **1 of
+  200 columns**, and a filter outside the window still prunes to 1 of 3 files.
+
+### Design notes
+
+`WindowSpec` is **immutable and frame-independent** — it holds no DataFrame, so a column
+name inside it stays unresolved until the plan it lands in is analysed, and one spec can
+serve several frames. Every method returns a new spec, so a spec handed to two columns
+cannot be changed by either.
+
+Boundaries follow the reference's sign convention — negative preceding, positive
+following, zero the current row — with `Window.unboundedPreceding`/`unboundedFollowing`
+carrying the same signed-64-bit extremes the reference uses, so a script passing those
+numbers directly still works. `abs()` is applied on the way out because SQL states
+distance and direction separately.
+
+`monotonically_increasing_id` is `row_number() OVER () - 1`. The reference only promises
+monotonic and unique, not consecutive; here there is one partition, so they come out
+consecutive, and anything relying on that is relying on more than either engine promises.
+
+---
+
+## Phase 6 — Complex types · **DONE** (2026-08-31)
+
+Green on: `uv run tox` (lint · mypy · 1177 tests against the built wheel · dist) and
+`uv run pytest -m integration` (11 passed). Test count went 1115 → 1177.
+
+**Built:** `sql/generators.py` (`SchemaAwareColumn`, `GeneratorColumn`,
+`StructPutColumn`, `StructDropColumn`), `Column.withField` / `dropFields`,
+`printSchema(level=...)`, and 26 more `F.*` names — the `explode` family, the JSON
+family, the map family, and the higher-order functions. 314 names now. 62 tests in
+`tests/fixture/test_complex_types.py`.
+
+### Reading already worked; generating rows did not
+
+The first thing the phase found was how little of it was left to do. Struct, array and
+map columns already read, projected and round-tripped end to end — `fx.nested` came back
+with a `Row` for the struct, a list for the array and a dict for the map, and
+`col("person.name")`, `getField` and `getItem` all resolved. Phases 1–3 had built enough.
+
+What was missing was everything that **produces** rather than consumes.
+
+### Generators, and why they live in `select`
+
+`explode` yields one column for a list and **two** for a map; `inline` yields one per
+field of the exploded struct. So the number of output columns depends on the *type* of
+what is being exploded, which is not knowable in `F` — a `Column` there has no frame. So
+generators are a `Column` subclass that `DataFrame.select` expands, resolving the type
+through the same zero-row bind the schema property uses.
+
+Two findings made this far cheaper than expected:
+
+- **Rows came free.** DuckDB's `unnest` in a select list already turns one row into one
+  per element, so `explode` needed no lateral join and no plan surgery. It is an
+  ordinary expression that happens to change the cardinality.
+- **Repeating `unnest(x)` in one select list unnests once, not twice.** DuckDB
+  correlates the copies. That is what lets `posexplode` emit
+  `generate_subscripts(x, 1) - 1` beside `unnest(x)` and get matching pairs rather than
+  a cross product — `test_the_positions_pair_with_their_elements` is the guard, because
+  a cross product would have been four plausible-looking rows instead of two.
+
+`select` refuses **two** generators in one projection: they would have to agree on how
+many rows to produce, and there is no answer to that. The reference refuses it too.
+
+### Three defects the phase uncovered, two of them pre-existing
+
+| What | Detail |
+|---|---|
+| **`F.struct` with an aliased column emitted invalid SQL** | `F.struct(F.lit(1).alias("a"))` produced `{'a': 1 AS "a"}`, which will not parse. The alias names the field and then has to be *dropped from the value*. Nothing caught it because every earlier caller passed plain column names |
+| **`struct_insert` does not overwrite** | `withField` was written on the assumption that it replaces a field of the same name. It refuses one — `Duplicate struct entry name` — so `withField` had to become schema-aware and rebuild the struct, exactly as `dropFields` does |
+| **sqlglot's `Bracket` is 0-based** | `p[1]` generated `p[2]` for DuckDB: the node treats its subscript as 0-based and adds one. The error then names an index the query never mentioned. `struct_extract(p, 1)` is unambiguous and is what is used. Carry-over note 12's hazard, in a new place |
+
+### Conformance work that was actually needed
+
+Most of the DuckDB spellings agreed with the reference and needed nothing. Two did not,
+and both are on empty input — the case a test over a populated fixture never reaches:
+
+- **`exists` over an empty list.** `list_bool_or([])` is NULL; the reference says false.
+- **`forall` over an empty list.** `list_bool_and([])` is NULL; the reference says true,
+  vacuously.
+
+Both are now spelled out as three-valued `CASE`s — true / NULL when a NULL element is
+present / false — rather than left to the aggregate. `fx.nested`'s second row has an
+empty `tags`, which is why the suite reaches this at all.
+
+**`aggregate`** needed the same care for the same reason: DuckDB's `list_reduce` has no
+initial value and starts from the first element, so the zero is **prepended to the
+list**. That is the same fold, and it is also what makes an empty list return the zero
+rather than NULL.
+
+### One divergence recorded
+
+`map_concat` refuses maps whose value types differ (`map<string,int>` with
+`map<string,bigint>`) where the reference widens. It refuses **loudly**, so the exposure
+is an error rather than a wrong answer; cast the narrower side.
+
+---
+
+## Phase 7 — Write path v1 · **DONE** (2026-08-31)
+
+Green on: `uv run tox` (lint · mypy · 1218 tests against the built wheel · dist) and
+`uv run pytest -m integration` (11 passed). Test count went 1177 → 1218.
+
+**Built:** `sql/writer.py` (`DataFrameWriter`), `df.write`, `Session._insert` for SQL
+`INSERT INTO` / `INSERT OVERWRITE`, and `Session._invalidate_source`. 41 tests in
+`tests/fixture/test_write.py`, each writing into its own throwaway table in a `wr`
+namespace and dropping it afterwards — the `fx.*` fixtures are session-scoped and
+deliberately immutable.
+
+| Piece | Behaviour |
+|---|---|
+| `saveAsTable` | creates the table when missing, in **every** mode — the mode is about existing data, and there is none |
+| modes | `append`, `overwrite`, `ignore`, and `error`/`errorifexists` as the default |
+| `insertInto` | never creates; matches columns **by position**, not by name |
+| `partitionBy` / `partitionedBy` | identity partitioning on a **newly created** table |
+| `sortBy`, `tableProperty` | likewise, on creation only |
+| `partitionOverwriteMode=dynamic` | replaces only the partitions the incoming data touches |
+| SQL `INSERT` | routed through the same writer, so both surfaces agree (P1) |
+
+### Two findings that changed the design
+
+**A write was invisible to the session that made it.** Every count in the first smoke
+test came back unchanged — create 5, append 5, overwrite 5 — which reads like the write
+silently failing. It was the *read* that was stale: a `ScanSource` holds a PyIceberg
+table pinned to the snapshot it was loaded at, and the session caches sources for its
+whole lifetime. `_invalidate_source` now drops the entry after a write, matching on the
+resolved identifier so `nyc.trips` and `trips` both go. A frame built *before* the write
+keeps its snapshot, which is read-your-plan rather than a leak, and has its own test.
+
+**PyIceberg 0.11 already implements dynamic partition overwrite.** The hardest item on
+PLAN.md's list — "overwrite only the partitions present in the incoming data" — is
+`Table.dynamic_partition_overwrite`, found while reading the API. It detects the
+partition values in the incoming Arrow table itself, so nothing here has to translate a
+partition spec into an overwrite predicate. That removed the one part of this phase that
+would have needed a transform-aware boundary calculation, and with it the risk of a
+wrong `overwrite_filter` deleting data it should not have.
+
+### Two of PLAN.md's Phase 7 goals turned out to be wrong about the world
+
+Both are measured, not assumed, and both have a test that will say so if the world
+changes.
+
+**"Streaming Arrow batches from DuckDB → PyIceberg."** Not possible on 0.11.1:
+`Transaction.append` opens with `if not isinstance(df, pa.Table): raise ValueError`, so
+there is no reader or batch form to hand it. The whole result is materialised as one
+Arrow table. Chunking it into several appends would have bought streaming at the price of
+the atomicity below, which is the worse trade. `TestStreamingIsBlockedUpstream` asserts
+the refusal, so if a later PyIceberg accepts a reader, that test fails and the failure is
+the signal that this became buildable.
+
+**"One Iceberg snapshot per write."** True for an append; an **overwrite is two** —
+a `delete` then an `append` — because that is how Iceberg models replacing rows. What
+does hold is the property the goal was reaching for: `Table.overwrite` wraps both in a
+single transaction, so it is **one commit**, and no reader ever sees the table
+mid-overwrite. `TestSnapshotShape` pins both halves.
+
+### The nullability worry, resolved
+
+Phase 6's closing note warned that the analysed schema calls every column nullable, and
+that writing would not tolerate it. Half right:
+
+- **Creating** a table here does produce all-optional fields, because the schema comes
+  from the executed Arrow result. Recorded in `divergence.md`.
+- **Writing into** an existing table is safe regardless — PyIceberg's
+  `_check_pyarrow_schema_compatible` validates the incoming schema against the table's
+  own and rejects a mismatch before anything is written. That is also what turns a
+  by-position insert of mismatched types into a loud error rather than scrambled data,
+  which `test_a_type_mismatch_is_caught_rather_than_scrambled` pins.
+
+### Two unused exceptions put to work
+
+`TableAlreadyExistsException` and `TempTableAlreadyExistsException` had been in
+`errors.py`'s `__all__` since Phase 0 with no caller. The writer needed the first; the
+second replaced an `EngineValueError` that Phase 4's temp views should have used.
+
+---
+
+## Phase 8 — Row-level operations · **DONE** (2026-09-01)
+
+Green on: `uv run tox` (lint · mypy · **1302 tests against the built wheel** · dist) and
+`uv run pytest -m integration` (11 passed, against the real REST catalog + MinIO).
+Test count went 1218 → 1302.
+
+**Built:** `sql/rowlevel.py` — `DELETE`, `UPDATE` and `MERGE` on the SQL surface, which
+is the only surface the reference has for them. `Session.sql()` routes all three;
+`plan/pushdown.py` grew `scope_predicate` and `is_exactly_translatable`; `writer.py`'s
+`_commit` became the shared `commit_with_retry`. 72 tests in
+`tests/fixture/test_rowlevel.py`, 12 more across the two unit files.
+
+Every operation is **copy-on-write**, as decision 11 fixed. `MERGE` covers the full
+Spark grammar: `WHEN MATCHED [AND c] THEN UPDATE SET ... / SET * / DELETE`, `WHEN NOT
+MATCHED [AND c] THEN INSERT (cols) VALUES (...) / VALUES (...) / INSERT *`, and `WHEN
+NOT MATCHED BY SOURCE [AND c] THEN UPDATE / DELETE`, in clause order, first match wins.
+
+### The whole phase is one predicate written twice
+
+A row-level operation is a `SELECT` whose result *is* the new contents of the rows it
+touches, committed as `Table.overwrite(rows, overwrite_filter=P)`. PyIceberg deletes the
+rows `P` matches and appends `rows`, so `P` and the `WHERE` that produced `rows` must
+select **exactly** the same rows:
+
+| If `P` is | Then |
+|---|---|
+| wider than the `WHERE` | rows are deleted that were never written back — **data loss** |
+| narrower | rows survive the delete *and* arrive in the append — **duplication** |
+
+Phase 2's pushdown has no such exposure, and that is the thing worth carrying: there the
+SQL re-applies the filter, so an over-wide `P` costs I/O and nothing else. The whole of
+`translate_predicate` was written under that licence.
+
+So this phase added a **second, stricter gate** rather than tightening the first.
+`is_exactly_translatable` is a whitelist of node shapes whose translation has been read
+and found row-for-row exact; `LIKE` is the deliberate omission, since `StartsWith` is a
+fine pruning approximation and a bad deletion. And the trick that makes it safe is that
+both languages come from **one** set of sqlglot nodes: `scope_predicate` returns the
+PyIceberg expression *and* the nodes it was built from, and those nodes are what goes
+into the generated `WHERE`. There is no second translation to drift. A conjunct that
+fails the gate is dropped from both at once, which only ever widens the scope — more
+rows read and written back untouched, never a different answer.
+
+`TestScopeIsExact` is the class that would notice either failure: every case mixes a
+translatable conjunct with an untranslatable one, and asserts on the rows *outside* the
+scope, which are the ones a wrong predicate takes away or duplicates.
+
+### Two defects found by building it, both silent
+
+**1. A marker column cannot survive subquery merging — and the failure empties the table.**
+
+The obvious shape for `MERGE` is one `LEFT JOIN` with a column saying whether the join
+found a source row, since every real column can be NULL on its own account:
+
+```sql
+LEFT JOIN (SELECT s.*, TRUE AS __matched FROM src AS s) AS s ON ...
+```
+
+`merge_subqueries` flattens that, and `__matched` becomes the literal `TRUE` in the outer
+scope — where it no longer means "the join matched" but "there is a row here". Every
+target row then looks matched, the `WHEN MATCHED ... DELETE` branch fires for all of
+them, and the statement **empties the table and reports success**. It was caught by a
+by-source test returning `[]`.
+
+A window-function marker survives the merge, and that is exactly the wrong fix: it works
+by accident of which subqueries sqlglot declines to flatten. So the merge was
+restructured into three queries whose matchedness is a *predicate* — an inner join, where
+every row is matched by construction, and `NOT EXISTS`, which no rewrite can turn into a
+constant. It costs one more scan of the target and buys a property that does not depend
+on the optimizer's rule list.
+
+| Query | Rows |
+|---|---|
+| matched | target rows joining a source row, after the first `WHEN MATCHED` that fires |
+| unmatched | target rows joining none, after the first `WHEN NOT MATCHED BY SOURCE` |
+| inserted | source rows joining no target row, expanded by `WHEN NOT MATCHED` |
+
+**2. sqlglot's `simplify` gives the wrong answer for `CASE ... WHEN TRUE`.**
+
+A `CASE` whose always-true branch is not the first one folds to that branch's value, and
+every branch before it is discarded:
+
+```
+CASE WHEN a = 1 THEN 'one' WHEN a <= 2 THEN 'two' WHEN TRUE THEN 'rest' END  ->  'rest'
+```
+
+DuckDB answers `'one'`. This is a **live wrong-answer path on the read side too** — any
+hand-written `Session.sql()` carrying that shape was affected, and nothing raised. Found
+because the merge's clause chains generate exactly it: an unconditional `WHEN MATCHED`
+is a `WHEN TRUE` branch.
+
+Fixed in two places. `optimize_plan` now normalises the shape away before the rules run —
+an always-true branch becomes the `ELSE`, and what follows it is dropped, which no
+reachable row can tell apart — so `simplify` never meets the case it mishandles. And the
+generator no longer produces it: an unconditional clause *is* the `ELSE`, which is the
+honest reading anyway. `TestAlwaysTrueCaseBranches` pins the first, and would fail if a
+later sqlglot fixes it and the normalisation is removed carelessly.
+
+### Where the file-scope minimisation comes from
+
+| Statement | Scope |
+|---|---|
+| `DELETE` with a fully exact predicate | none needed — PyIceberg's own `delete(P)`, which can drop a wholly-matching file without reading it |
+| `DELETE` / `UPDATE`, otherwise | the exactly-translatable conjuncts of the `WHERE` |
+| `MERGE`, no by-source clause | the `ON`'s target-only conjuncts, **plus** an `IN` list of the distinct join keys the source actually holds |
+| `MERGE` with a by-source clause | the whole table — there is no predicate for "everything the source does not name" |
+| `MERGE`, `WHEN NOT MATCHED` only | no rewrite at all: it is an `append`, and one snapshot |
+
+The `IN`-list narrowing is the one that matters at scale — it is the difference between
+merging ten rows into a 41M-row table and rewriting the table. It covers `integer`,
+`long`, `string` and `date` keys, and gives up past 1000 distinct values; a float,
+decimal or timestamp key is left alone rather than reasoned about, because the literal is
+the thing that has to mean the same in both languages. Giving up always widens the scope,
+never changes the answer. `TestMergeScope` measures it on the partitioned fixture: a
+one-key merge leaves two of the three partition files untouched.
+
+### Concurrency
+
+PLAN.md asked for optimistic commit with conflict detection and bounded retry. The
+window that matters is between the **read** and the commit, and PyIceberg's own
+`CommitFailedException` does not cover it: an `overwrite` computed from stale rows is a
+perfectly valid commit that happens to erase someone else's. So the table is re-read at
+the start of every attempt, its snapshot id is checked immediately before committing, and
+a statement whose table moved is planned again from scratch — re-run, not replayed, since
+the rows to write back are a function of the rows that were there. Four attempts, then
+`QueryExecutionException`. `TestConcurrency` opens the window by hand with an interloping
+append, and asserts the replan happened *and* that the interloper's row survived.
+
+### Refused rather than half-done
+
+`DELETE ... USING` and `UPDATE ... FROM` (use a subquery), and `UPDATE t SET s.field = v`
+— nested-field assignment needs the schema-aware `withField` machinery Phase 6 built for
+the DataFrame surface, reachable from SQL only once Phase 9 has done the same for DDL.
+Each names what to do instead. Telling `SET t.vendor` from `SET person.name` is not a
+question the parse tree can answer — sqlglot spells both as two parts — so it is decided
+by asking the table whether the first part is one of its columns.
+
+### Carried forward
+
+- **PyIceberg's native `delete` handles NULL correctly.** Checked rather than assumed:
+  `DELETE ... WHERE amount > 20` keeps the NULL-amount row on both the native and the
+  rewrite path, and `test_the_rewrite_path_agrees_with_the_native_one` runs the two
+  side by side on the same data.
+- **`_invalidate_source` again.** Phase 7's note held: every attempt drops the cached
+  source before reading, which is also what makes the snapshot it validates the snapshot
+  it read.
+- Merge-on-read is still Phase 13, and nothing here got closer to it — but nothing here
+  got in its way either: the delete-file path would replace the commit, not the planning.
 
 ---
 
@@ -612,7 +1231,9 @@ keeps it closed.
 
 ## Carry-over notes
 
-Things found during earlier phases that later phases need.
+Things found during earlier phases that later phases need. [FINDINGS.md](FINDINGS.md) is the
+fuller register: every dependency bug and wrong-answer trap found so far, grouped by kind,
+with the rule each one taught.
 
 | # | Note | Affects |
 |---|---|---|
@@ -620,12 +1241,13 @@ Things found during earlier phases that later phases need.
 | ~~6~~ | ~~`pandas>=2.2` resolves to pandas 3.x, whose default string dtype differs from Spark's `toPandas()` `object` dtype~~ — **closed in Phase 3**: `exec/result.py` rebuilds string columns from `to_pylist()`, correcting the dtype and the null sentinel together. | — |
 | 12 | sqlglot wraps some typed nodes (`Greatest`, `Least`, `ConcatWs`) in a NULL-propagating `CASE` for DuckDB, and renders `Log`'s operands reversed. Prefer a plain call and a value-level test over assuming a typed node is conformant. | Phase 3 onward |
 | ~~9~~ | ~~Golden conformance files generated from real PySpark~~ — **closed by decision 13**: no PySpark at any stage. Cases are written from Spark's published behaviour with a citation each. | — |
-| 10 | The optimizer declines to rewrite a `UNION` whose output names need restoring, so set operations get no pushdown. Fixable by re-aliasing the first branch. | Phase 4 |
+| ~~10~~ | ~~A set operation whose branches need their output names restored loses **all** pushdown~~ — **closed in Phase 4**: `_naming_branch` re-aliases the leftmost branch, so a set operation over an unaliased aggregate now prunes like any other query. Measured before and after in the Phase 4 section. | — |
 | 11 | Two references to one table merge to a single scan (union of columns, OR of predicates). Correct, but a self-join with disjoint filters prunes less than it could. | Phase 4 |
 | 13 | Functions built by *composition* in `sql/functions.py` are reachable only through `F.*`; `Session.sql()` hands the bare name to DuckDB. `weekday`/`dayofweek` answer **silently differently**; 8 more raise. Deferred by decision 16. | **Phase 15** |
 | 14 | `size(NULL)` gives `NULL` on both surfaces; the reference says `-1`. `array_size`'s own docstring says the two must differ, but `size` is `sg.ArraySize`, which makes them aliases. | **Phase 15** |
 | 15 | `explain()`'s `bytes_scanned` is the *selected files'* size, not bytes read — it ignores column pruning, so a narrow query looks far more expensive than it is. | Phase 10 |
 | 16 | An unfiltered `count(*)` reads parquet footers when Iceberg's manifests already hold the row count (~2× on a 357-file table, and it grows with file count). | Phase 10 |
+| 17 | A generated plan may not carry meaning in a **constant** column: `merge_subqueries` flattens the subquery and the constant folds, so `TRUE AS __matched` past a LEFT JOIN stops meaning “the join matched”. Express it as a predicate (`EXISTS`, or an inner join) instead. | any phase generating SQL |
 
 ---
 

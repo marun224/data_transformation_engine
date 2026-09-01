@@ -24,6 +24,8 @@ from icetl.plan.pushdown import (
     ColumnResolver,
     binds_against,
     conjuncts,
+    is_exactly_translatable,
+    scope_predicate,
     translate_predicate,
 )
 from tests.predicates import (
@@ -318,3 +320,103 @@ class TestBindValidation:
     def test_binding_never_raises(self) -> None:
         """Whatever pyiceberg throws, the answer is False, not an exception."""
         assert not binds_against(EqualTo("id", "not-a-number"), SCHEMA)
+
+
+class TestExactTranslation:
+    """The gate the write path stands on (Phase 8).
+
+    Read pushdown may translate a predicate into something *wider* than the SQL: the
+    SQL re-applies the filter, so a file that need not have been read costs only I/O.
+    A row-level write has no second chance -- `overwrite(rows, overwrite_filter=P)`
+    deletes what `P` matches and writes back what the SQL kept -- so there the two must
+    agree row for row. `is_exactly_translatable` is the whitelist that says which node
+    types have been read and found to.
+    """
+
+    def exact(self, sql: str) -> bool:
+        parsed = sqlglot.parse_one(f"SELECT * FROM t AS t WHERE {sql}", read="duckdb")
+        return is_exactly_translatable(parsed.args["where"].this)
+
+    def test_comparisons_and_membership_are_exact(self) -> None:
+        for sql in (
+            "id = 1",
+            "id <> 1",
+            "amount >= 2.5",
+            "id IN (1, 2, 3)",
+            "id BETWEEN 1 AND 4",
+            "vendor IS NULL",
+            "vendor IS NOT NULL",
+            "is_active",
+        ):
+            assert self.exact(sql), sql
+
+    def test_and_or_not_are_exact_when_both_sides_are(self) -> None:
+        assert self.exact("id = 1 AND vendor = 'a'")
+        assert self.exact("id = 1 OR vendor = 'a'")
+        assert self.exact("NOT (id = 1)")
+        assert not self.exact("id = 1 OR vendor LIKE 'a%'")
+
+    def test_like_is_not_exact_even_though_it_translates(self) -> None:
+        """`StartsWith` prunes correctly and is still not a row-for-row equivalent.
+
+        The deliberate omission: it is the one node whose translation is a *pattern*
+        rewritten into a different operator, and escapes are spelled differently on
+        each side. Good enough to prune with, not good enough to delete with.
+        """
+        assert translate("vendor LIKE 'a%'") is not None
+        assert not self.exact("vendor LIKE 'a%'")
+
+    def test_it_gates_the_shape_and_leaves_the_rest_to_the_translator(self) -> None:
+        """`upper(v) = 'A'` is an `EQ`, so it passes here -- and is still not pushed.
+
+        The two checks are separate on purpose. This one answers "would a translation
+        of this shape be exact"; `translate_predicate` answers "is there one at all",
+        and declines because neither side of the comparison is a bare column. A caller
+        needs both, which is what `scope_predicate` does.
+        """
+        assert self.exact("upper(vendor) = 'A'")
+        assert translate("upper(vendor) = 'A'") is None
+
+
+class TestScopePredicate:
+    """`scope_predicate` hands back both languages, built from the same nodes."""
+
+    def scope(
+        self, sql: str, *, exact_only: bool
+    ) -> tuple[BooleanExpression, list[str], list[str]]:
+        parsed = sqlglot.parse_one(f"SELECT * FROM t AS t WHERE {sql}", read="duckdb")
+        predicate, kept, dropped = scope_predicate(
+            conjuncts(parsed.args["where"]),
+            ColumnResolver("t", COLUMNS),
+            SCHEMA,
+            exact_only=exact_only,
+        )
+        return predicate, [term.sql() for term in kept], [term.sql() for term in dropped]
+
+    def test_the_kept_terms_are_the_ones_the_predicate_was_built_from(self) -> None:
+        predicate, kept, dropped = self.scope("id = 1 AND upper(vendor) = 'A'", exact_only=True)
+        assert kept == ["id = 1"]
+        assert dropped == ["UPPER(vendor) = 'A'"]
+        assert predicate == EqualTo("id", 1)
+
+    def test_dropping_a_conjunct_only_ever_widens_the_scope(self) -> None:
+        """`A AND B` -> `A`: more rows, never fewer. That is what makes it safe."""
+        wide, _, _ = self.scope("id = 1 AND abs(amount) > 1", exact_only=True)
+        assert wide == EqualTo("id", 1)
+
+    def test_nothing_translatable_gives_the_whole_table(self) -> None:
+        predicate, kept, _ = self.scope("upper(vendor) = 'A'", exact_only=True)
+        assert isinstance(predicate, AlwaysTrue)
+        assert kept == []
+
+    def test_exact_only_refuses_what_plain_pushdown_accepts(self) -> None:
+        loose, kept_loose, _ = self.scope("vendor LIKE 'a%'", exact_only=False)
+        strict, kept_strict, _ = self.scope("vendor LIKE 'a%'", exact_only=True)
+        assert kept_loose and not isinstance(loose, AlwaysTrue)
+        assert kept_strict == [] and isinstance(strict, AlwaysTrue)
+
+    def test_a_term_naming_another_table_is_not_this_table_s_business(self) -> None:
+        predicate, kept, dropped = self.scope("id = 1 AND other.x = 2", exact_only=True)
+        assert kept == ["id = 1"]
+        assert dropped == ["other.x = 2"]
+        assert predicate == EqualTo("id", 1)

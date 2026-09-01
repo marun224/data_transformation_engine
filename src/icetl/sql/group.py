@@ -16,6 +16,7 @@ grouping key. SQL enforces that itself, so a mistake surfaces as a binder error 
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlglot import exp
@@ -50,22 +51,50 @@ _DICT_FORM_FUNCTIONS = frozenset(
 )
 
 
+#: The reference caps a pivot at `spark.sql.pivotMaxValues` columns. The same guard is
+#: worth having for the same reason: a pivot on a high-cardinality column does not fail,
+#: it succeeds and returns thousands of columns.
+_PIVOT_MAX_VALUES = 10_000
+
+
+@dataclass(frozen=True)
+class _Pivot:
+    """A pending pivot: the expression to switch on, and the values to switch to."""
+
+    expression: exp.Expression
+    values: list[Any]
+
+
+#: Grouping kind -> the `exp.Group` argument and node that spells it. `groupBy` is the
+#: plain form; `rollup` and `cube` are grouping *sets*, which produce extra super-
+#: aggregate rows with NULL standing in for each rolled-up key.
+_GROUPING_SETS: dict[str, tuple[str, type[exp.Expression]]] = {
+    "rollup": ("rollup", exp.Rollup),
+    "cube": ("cube", exp.Cube),
+}
+
+
 class GroupedData:
-    """The result of `df.groupBy(...)`, awaiting an aggregation."""
+    """The result of `df.groupBy(...)`, `df.rollup(...)` or `df.cube(...)`."""
 
     def __init__(
         self,
         df: DataFrame,
         grouping: list[exp.Expression],
         names: list[str],
+        kind: str = "groupBy",
+        pivot: _Pivot | None = None,
     ) -> None:
         self._df = df
         self._grouping = grouping
         self._names = names
+        self._kind = kind
+        self._pivot = pivot
 
     def __repr__(self) -> str:
         keys = ", ".join(self._names) if self._names else "<global>"
-        return f"GroupedData[{keys}]"
+        label = "GroupedData" if self._kind == "groupBy" else f"GroupedData({self._kind})"
+        return f"{label}[{keys}]"
 
     # -- the one method that builds a plan ---------------------------------
 
@@ -102,6 +131,55 @@ class GroupedData:
                 aggregates = [self._aggregate(item) for item in items]
 
         return self._build(aggregates)
+
+    # -- pivot ---------------------------------------------------------------
+
+    def pivot(self, pivot_col: str, values: list[Any] | None = None) -> GroupedData:
+        """Turn the distinct values of `pivot_col` into columns.
+
+        **This is the one transformation that runs a query.** With `values` omitted,
+        the distinct values have to be known before the projection can be written, so
+        they are fetched now -- exactly as the reference engine does, and for the same
+        reason. Pass `values` explicitly to keep the call lazy, and to fix the column
+        order regardless of what the data happens to hold.
+
+        Compiled as conditional aggregation (`sum(CASE WHEN k = 'x' THEN v END)`) rather
+        than through DuckDB's own `PIVOT`, which is a statement rather than an
+        expression and would not compose with the rest of a plan.
+        """
+        if self._pivot is not None:
+            raise EngineValueError("pivot() cannot be applied twice to the same grouping.")
+        if self._kind != "groupBy":
+            raise EngineValueError(f"pivot() cannot be combined with {self._kind}().")
+        if not isinstance(pivot_col, str):
+            raise EngineTypeError(f"pivot() expects a column name, got {type(pivot_col).__name__}.")
+
+        expression = self._df._column_ref(pivot_col)._expression.copy()
+        resolved = list(values) if values is not None else self._distinct_values(expression)
+        if values is not None and not resolved:
+            raise EngineValueError("pivot() needs at least one value.")
+        if len(resolved) > _PIVOT_MAX_VALUES:
+            raise EngineValueError(
+                f"pivot() would produce {len(resolved)} columns, over the limit of "
+                f"{_PIVOT_MAX_VALUES}. Pass `values` to choose the ones you want."
+            )
+        return GroupedData(
+            self._df, self._grouping, self._names, self._kind, _Pivot(expression, resolved)
+        )
+
+    def _distinct_values(self, expression: exp.Expression) -> list[Any]:
+        """The distinct values of the pivot column, ordered so the output is stable.
+
+        NULL sorts last and becomes a column of its own, as it does in the reference --
+        a pivot key of NULL is a group, not an absence.
+        """
+        plan = self._df._rebase_projection()
+        plan.set(
+            "expressions", [as_expression(exp.alias_(expression.copy(), "value", quoted=True))]
+        )
+        plan.set("distinct", exp.Distinct())
+        rows = self._df._derive(cast(exp.Expression, plan)).collect()
+        return sorted((row[0] for row in rows), key=lambda v: (v is None, str(v)))
 
     # -- shortcuts ----------------------------------------------------------
 
@@ -184,7 +262,86 @@ class GroupedData:
             as_expression(exp.alias_(key.copy(), name, quoted=True))
             for key, name in zip(self._grouping, self._names, strict=True)
         ]
+        if self._pivot is not None:
+            aggregates = self._pivoted(aggregates)
         plan.set("expressions", projection + aggregates)
         if self._grouping:
-            plan.set("group", exp.Group(expressions=[key.copy() for key in self._grouping]))
+            plan.set("group", self._group_clause())
         return self._df._derive(cast(exp.Expression, plan))
+
+    def _pivoted(self, aggregates: list[exp.Expression]) -> list[exp.Expression]:
+        """One aggregate per (value, aggregate) pair, each seeing only its own rows.
+
+        Naming follows the reference: with a single aggregate the column is the value
+        alone (`a`), and with several it is `value_aggregate` (`a_total`) -- because with
+        one aggregate the value is enough to identify the column, and with two it is not.
+        """
+        assert self._pivot is not None
+        columns: list[exp.Expression] = []
+        for value in self._pivot.values:
+            condition = _matches(self._pivot.expression, value)
+            for aggregate in aggregates:
+                label = _pivot_label(value)
+                name = label if len(aggregates) == 1 else f"{label}_{aggregate.alias_or_name}"
+                bare = as_expression(aggregate.unalias())
+                restricted = _restrict_aggregates(bare, condition)
+                columns.append(as_expression(exp.alias_(restricted, name, quoted=True)))
+        return columns
+
+    def _group_clause(self) -> exp.Group:
+        """The GROUP BY clause for this kind of grouping.
+
+        `rollup` and `cube` go in their own `exp.Group` argument rather than in
+        `expressions` -- a grouping set replaces the plain key list, it does not
+        accompany one, and putting keys in both would group by them twice.
+        """
+        keys = [key.copy() for key in self._grouping]
+        if self._kind == "groupBy":
+            return exp.Group(expressions=keys)
+        argument, node = _GROUPING_SETS[self._kind]
+        return exp.Group(**{argument: [node(expressions=keys)]})
+
+
+def _pivot_label(value: Any) -> str:
+    """The column name a pivot value produces. NULL becomes the string `null`."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _matches(expression: exp.Expression, value: Any) -> exp.Expression:
+    """`expression IS NOT DISTINCT FROM value`.
+
+    Null-safe deliberately: `k = NULL` is never true, so a plain `=` would give every
+    row of a NULL pivot group an empty column rather than its own.
+    """
+    from icetl.sql.column import to_literal
+
+    return exp.NullSafeEQ(this=expression.copy(), expression=to_literal(value))
+
+
+def _restrict_aggregates(expression: exp.Expression, condition: exp.Expression) -> exp.Expression:
+    """Rewrite every aggregate in `expression` to see only the rows `condition` selects.
+
+    `sum(v)` becomes `sum(CASE WHEN cond THEN v END)`, which is how the reference
+    compiles a pivot too. Rewriting each aggregate rather than the whole expression is
+    what makes a composite like `sum(a) / count(b)` come out right: the division has to
+    happen after both sides are restricted, not before.
+
+    `count(*)` has no argument to restrict, so it counts a literal instead --
+    `count(CASE WHEN cond THEN 1 END)`, which still counts rows and still skips the
+    ones the condition excludes.
+    """
+
+    def rewrite(node: exp.Expression) -> exp.Expression:
+        if not isinstance(node, exp.AggFunc):
+            return node
+        inner = node.this
+        if inner is None or isinstance(inner, exp.Star):
+            inner = exp.Literal.number(1)
+        node.set("this", exp.Case(ifs=[exp.If(this=condition.copy(), true=inner.copy())]))
+        return node
+
+    return expression.copy().transform(rewrite, copy=False)

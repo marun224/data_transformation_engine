@@ -15,10 +15,11 @@ semantics-preserving, so keeping the last stage that succeeded is always sound.
 **The output-name guarantee.** `qualify` renames unaliased projections to `_col_0`,
 which for us would be a wrong answer -- the reference engine calls that column `sum(amount)` and
 scripts index on the name. So the optimized tree is adopted only if its output
-columns can be made to match the names analysis already computed, and the top-level
-projections are re-aliased to those names before it is used. Anything that cannot be
-reconciled is discarded and the original plan runs instead: a slower plan is a cost,
-a renamed column is a bug.
+columns can be made to match the names analysis already computed, and the projections
+that name the output are re-aliased before it is used -- the top-level ones for a
+SELECT, the leftmost branch's for a set operation. Anything that cannot be reconciled
+is discarded and the original plan runs instead: a slower plan is a cost, a renamed
+column is a bug.
 """
 
 from __future__ import annotations
@@ -99,9 +100,68 @@ def _apply(name: str, expression: exp.Expression, schema: MappingSchema) -> exp.
     raise AssertionError(f"unknown rule {name!r}")  # pragma: no cover
 
 
+def _close_always_true_branches(expression: exp.Expression) -> exp.Expression:
+    """Turn `... WHEN TRUE THEN v ...` into `... ELSE v END`, dropping what follows.
+
+    Semantics-preserving on its own -- no branch after an always-true one can ever be
+    reached -- and it has to run **before** `simplify`, because sqlglot 30.17 folds a
+    `CASE` whose always-true branch is not the first one down to that branch's value
+    and throws the earlier branches away:
+
+        CASE WHEN a = 1 THEN 'one' WHEN TRUE THEN 'rest' END   ->   'rest'
+
+    DuckDB answers `'one'`, so the rule is a wrong answer rather than a missed
+    optimisation, and it is silent. Normalising the shape away first means `simplify`
+    never sees the case it mishandles. Only a `CASE` with no operand is touched: in
+    `CASE x WHEN TRUE THEN ...` the branch is the comparison `x = TRUE`, which is not
+    always true at all.
+    """
+
+    def rewrite(node: exp.Expression) -> exp.Expression:
+        if not isinstance(node, exp.Case) or node.args.get("this") is not None:
+            return node
+        branches = list(node.args.get("ifs") or [])
+        for index, branch in enumerate(branches):
+            condition = branch.this
+            if not (isinstance(condition, exp.Boolean) and condition.this is True):
+                continue
+            value = branch.args.get("true")
+            if value is None:  # pragma: no cover - defensive
+                return node
+            if index == 0:
+                # Nothing is conditional any more, so there is no CASE left to write.
+                return value.copy()
+            closed = node.copy()
+            closed.set("ifs", [item.copy() for item in branches[:index]])
+            closed.set("default", value.copy())
+            return closed
+        return node
+
+    return expression.transform(rewrite, copy=True)
+
+
 def _named_selects(expression: exp.Expression) -> list[str]:
     """The output column names of a query node, or `[]` for anything else."""
     return list(expression.named_selects) if isinstance(expression, exp.Query) else []
+
+
+def _naming_branch(expression: exp.Expression) -> exp.Select | None:
+    """The SELECT whose projections name `expression`'s output columns.
+
+    For a plain SELECT that is the node itself. For a set operation it is the
+    **leftmost branch**, however deeply nested: `A UNION B UNION C` parses left-heavy,
+    and SQL takes the output names from the first branch alone. Re-aliasing that one
+    branch renames the whole set operation, which is the whole of carry-over note 10 --
+    before this, any set operation needing a rename lost every optimization, predicate
+    and projection pushdown included, not merely the rename.
+
+    Only the first branch is touched: the others match positionally and their own
+    names are never read, so rewriting them would be noise.
+    """
+    node = expression
+    while isinstance(node, exp.SetOperation):
+        node = node.this
+    return node if isinstance(node, exp.Select) else None
 
 
 def _restore_output_names(
@@ -116,12 +176,11 @@ def _restore_output_names(
     if _named_selects(expression) == list(expected):
         return expression
 
-    # A UNION's names come from its first branch, several levels down; rather than
-    # reach in and rewrite that, decline and let the original plan run.
-    if not isinstance(expression, exp.Select):
+    branch = _naming_branch(expression)
+    if branch is None:
         return None
 
-    projections = expression.expressions
+    projections = branch.expressions
     if len(projections) != len(expected):
         return None
     if any(isinstance(projection, exp.Star) for projection in projections):
@@ -132,6 +191,12 @@ def _restore_output_names(
         if projection.alias_or_name == name:
             continue
         projections[index] = exp.alias_(projection.unalias(), name, quoted=True)
+
+    # `branch` was mutated in place, so a set operation is renamed by this too. Verify
+    # rather than assume: a branch shape that did not take the rename must still be
+    # declined, or the caller would promise names the plan does not produce.
+    if _named_selects(expression) != list(expected):
+        return None
     return expression
 
 
@@ -143,7 +208,7 @@ def optimize_plan(
     `output_names` is the analysed schema's column list -- the names the caller has
     already promised the user -- and is what the result is held to.
     """
-    current = plan.copy()
+    current = _close_always_true_branches(plan.copy())
     stages: list[str] = []
     note: str | None = None
 

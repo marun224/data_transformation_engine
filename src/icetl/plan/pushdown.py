@@ -51,7 +51,7 @@ from icetl.plan.annotations import PlanAnnotations, ScanRequest
 from icetl.plan.builder import source_key
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from pyiceberg.schema import Schema as IcebergSchema
 
@@ -61,6 +61,8 @@ __all__ = [
     "ColumnResolver",
     "binds_against",
     "extract_scan_requests",
+    "is_exactly_translatable",
+    "scope_predicate",
     "translate_predicate",
 ]
 
@@ -339,6 +341,90 @@ def conjuncts(where: exp.Expression | None) -> list[exp.Expression]:
     return out
 
 
+#: Node types whose translation above is *exact* -- the PyIceberg predicate matches the
+#: same rows the SQL does, nulls included -- rather than merely a superset good enough
+#: for file pruning. `exp.Like` is the one deliberate omission: `StartsWith` covers a
+#: `'abc%'` pattern but the two spell escapes and collation differently, and the write
+#: path cannot afford "close enough".
+_EXACT_NODES: tuple[type[exp.Expression], ...] = (
+    exp.EQ,
+    exp.NEQ,
+    exp.GT,
+    exp.GTE,
+    exp.LT,
+    exp.LTE,
+    exp.Is,
+    exp.In,
+    exp.Between,
+    exp.Column,
+)
+
+
+def is_exactly_translatable(node: exp.Expression) -> bool:
+    """True when a translation of `node`, *if one is produced*, selects the same rows.
+
+    A gate on the node's shape, not a promise that it translates: `upper(v) = 'A'` is an
+    `EQ` and passes here, then `translate_predicate` declines it because neither side is
+    a bare column. Both have to hold, which is why `scope_predicate` asks both.
+
+    Read pushdown never needs this: there, a predicate that matches *more* rows than
+    the SQL does costs a little wasted I/O and nothing else, because the SQL re-applies
+    the filter afterwards. The **write** path has no such second chance -- a row-level
+    operation deletes the rows a PyIceberg predicate matches and writes back the rows a
+    SQL predicate kept, so the two must agree row for row or the difference is data loss
+    (predicate too wide) or duplication (too narrow).
+
+    So this is the gate that lets the same predicate be used in both languages at once.
+    It is a whitelist rather than a check: a node type is admitted only after its
+    translation has been read and found exact.
+    """
+    if isinstance(node, exp.Paren):
+        return is_exactly_translatable(node.this)
+    if isinstance(node, (exp.And, exp.Or)):
+        first, second = _operands(node)
+        return is_exactly_translatable(first) and is_exactly_translatable(second)
+    if isinstance(node, exp.Not):
+        return is_exactly_translatable(node.this)
+    return isinstance(node, _EXACT_NODES)
+
+
+def scope_predicate(
+    terms: Sequence[exp.Expression],
+    resolver: ColumnResolver,
+    schema: IcebergSchema,
+    *,
+    exact_only: bool = False,
+) -> tuple[BooleanExpression, list[exp.Expression], list[exp.Expression]]:
+    """Split `terms` into the ones this table can be pruned by and the ones it cannot.
+
+    Returns the combined PyIceberg predicate, the terms it was built from, and the
+    terms left behind. The kept terms are returned as the caller's own nodes, so a
+    caller that needs the predicate in *both* languages -- which the row-level write
+    path does -- gets a SQL form guaranteed to be the same predicate rather than a
+    second translation that might drift from the first.
+
+    Every conjunct is bound one at a time, so a literal PyIceberg dislikes costs only
+    its own term rather than the whole predicate.
+    """
+    predicate: BooleanExpression = AlwaysTrue()
+    kept: list[exp.Expression] = []
+    dropped: list[exp.Expression] = []
+    for term in terms:
+        translated = None
+        if resolver.owns_every_column(term) and not (
+            exact_only and not is_exactly_translatable(term)
+        ):
+            translated = translate_predicate(term, resolver)
+            if translated is not None and not binds_against(translated, schema):
+                translated = None
+        if translated is None:
+            dropped.append(term)
+            continue
+        kept.append(term)
+        predicate = translated if isinstance(predicate, AlwaysTrue) else And(predicate, translated)
+    return predicate, kept, dropped
+
+
 def _unattributed(scope: Any, resolver: ColumnResolver) -> list[str]:
     """Unqualified columns in `scope`, classified into what they actually refer to.
 
@@ -411,24 +497,12 @@ def extract_scan_requests(
                 alias, {field.name: field.field_type for field in schema.fields}
             )
 
-            predicate: BooleanExpression = AlwaysTrue()
-            unpushed: list[str] = []
-            for term in terms:
-                if not resolver.owns_every_column(term):
-                    continue
-                translated = translate_predicate(term, resolver)
-                # Bound here, one conjunct at a time, so a literal PyIceberg dislikes
-                # costs only its own conjunct rather than the whole predicate.
-                if translated is not None and not binds_against(translated, schema):
-                    translated = None
-                if translated is None:
-                    unpushed.append(term.sql(dialect="duckdb"))
-                else:
-                    predicate = (
-                        translated
-                        if isinstance(predicate, AlwaysTrue)
-                        else And(predicate, translated)
-                    )
+            predicate, _, dropped = scope_predicate(terms, resolver, schema)
+            # A term mentioning another table is not "unpushed" for this one, it is
+            # simply none of its business, so it is not reported against it.
+            unpushed = [
+                term.sql(dialect="duckdb") for term in dropped if resolver.owns_every_column(term)
+            ]
 
             annotations.annotate(
                 node,

@@ -209,6 +209,198 @@ silent wrong answer if unhandled, which is why each has a fixture rather than a 
 | Unaliased projection names | sqlglot's `qualify` renames `sum(amount)` to `_col_0`. The optimized plan is adopted only if its output columns can be re-aliased to the names analysis already computed; otherwise the unoptimized plan runs instead | ✅ |
 | Identifier case in the optimizer | the optimizer runs in DuckDB's dialect, which is case-insensitive, so `VendorID` is normalised internally. Output names are restored from the analysed schema, so the user-visible spelling is unaffected | ✅ |
 | Nullability | the analysed schema comes from DuckDB, which has no non-nullable expression, so every field reports `nullable = true` even where Iceberg marked it required | ⚠️ |
+| `CASE ... WHEN TRUE THEN v ...` | sqlglot 30.17's `simplify` folds a `CASE` whose always-true branch is **not the first** down to that branch's value, discarding every branch before it — `CASE WHEN a = 1 THEN 'one' WHEN TRUE THEN 'rest' END` becomes `'rest'`. DuckDB answers `'one'`, so it is a silent wrong answer rather than a missed optimisation. The plan is normalised before the rules run — an always-true branch becomes the `ELSE` and what follows it is dropped, which no reachable row can tell apart — so `simplify` never meets the shape. Found in Phase 8 | ✅ |
+
+## Single-node divergences — Phase 4
+
+The reference is a distributed engine and icetl is not. Most of these are cases where a
+method's whole purpose is to move data between machines, and there are no machines to
+move it between; the methods exist so a script written against the reference runs
+unaltered, rather than failing on an attribute that will never mean anything here.
+
+| Behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `repartition`, `coalesce` | redistribute across partitions | **no-op**, returns the same frame | ⚠️ |
+| `F.broadcast(df)` | hints a join to ship the frame to every executor | **no-op**, returns the frame | ⚠️ |
+| `persist(storageLevel=...)` | picks memory/disk/serialised | refused — there is one storage level, a DuckDB temp table | ⚠️ |
+| `cache()` / `persist()` | lazy; marks the frame and materialises at the next action, returning `self` | **eager**, and returns a **new** frame. `cached = df.cache()` is the spelling that works | ⚠️ |
+| `sample(withReplacement=True)` | supported | **refused**. DuckDB draws each row at most once, and quietly returning a without-replacement sample to a caller who asked for the other is a wrong answer | ⚠️ |
+| `df.stat.approxQuantile(relativeError>0)` | error bound is the argument | DuckDB's `approx_quantile` bound is fixed, so the answer may be *more* accurate than asked and never less — which is what the argument promises | ✅ |
+| `df.stat.freqItems` | approximate (a sketch, because it counts across a cluster) | **exact** — one grouped scan per column. Strictly inside the same contract | ✅ |
+| `F.grouping_id()` with no arguments | means "every grouping column" | refused; the columns must be named. Nothing in `functions.py` can see what the query groups by, and DuckDB has no such spelling either | ⚠️ |
+| `catalog.dropTempView` | on `spark.catalog` | on the **session** (`session.dropTempView`) until `Session.catalog` lands in Phase 9 | ⚠️ |
+| `sortWithinPartitions` | sorts inside each partition | `sort` — there is one partition, so sorting within it sorts the frame | ⚠️ |
+| `range(numPartitions=...)` | splits the range across partitions | accepted and ignored | ⚠️ |
+| `dropDuplicates(subset)` | which row survives is undefined | also undefined (`DISTINCT ON`). Rely on the keys being unique, not on which row carried them | ✅ |
+
+`cache()` being eager is the one to know about. Nothing here mutates a plan in place, so
+a lazy mark would have nowhere to live; running now and handing back a new frame says
+the same thing without the mutation. The consequence is that `df.cache()` on its own
+caches nothing you can reach.
+
+## Set operations and grouping sets — Phase 4
+
+Checked against DuckDB before building, and **agreeing on every point**, which is why
+there is no conformance rule for any of it:
+
+| Behaviour | Reference | DuckDB | Status |
+|---|---|---|---|
+| `union` keeps duplicates | yes (`union` is `UNION ALL`) | yes | ✅ |
+| `EXCEPT ALL` subtracts multiplicities | 3 minus 1 leaves 2 | same | ✅ |
+| `INTERSECT ALL` keeps the smaller | min(3, 2) is 2 | same | ✅ |
+| `INTERSECT` / `EXCEPT` match NULL to NULL | yes, unlike `=` | same | ✅ |
+| `GROUPING(col)` on a rolled-up key | `1` | `1` | ✅ |
+| `GROUPING_ID(a, b)` bit order | most significant first | same | ✅ |
+
+Two behaviours are **deliberately preserved traps**, not defects — the reference has
+them, and hiding them would be a bigger surprise than keeping them:
+
+| Behaviour | Note |
+|---|---|
+| `union` matches **by position**, not by name | Two frames with the same names in a different order union into nonsense without complaint. The type widening makes it quieter rather than louder: `bigint` over `string` settles on `string`, so an `id` of `1` comes back as `'1'`. `unionByName` is the safe spelling |
+| A rolled-up key comes back as **NULL** | Indistinguishable from a real NULL in the data. A rollup over a column that already contains NULL produces two NULL rows meaning different things; `F.grouping` is the only thing that tells them apart |
+
+Two implementation choices worth recording because they are invisible from the outside:
+
+- **`pivot` compiles to conditional aggregation** (`sum(CASE WHEN k = 'x' THEN v END)`),
+  not to DuckDB's own `PIVOT`, which is a statement rather than an expression and would
+  not compose with the rest of a plan. The match is null-safe, so a NULL pivot key gets
+  its own column named `null` rather than an empty one.
+- **A set-operation branch is nested when it is itself a set operation.** DuckDB binds
+  `INTERSECT` tighter than `UNION ALL`, so an inlined `a.union(b).intersect(c)` would
+  evaluate `a UNION ALL (b INTERSECT c)` — a different query that raises nothing and
+  answers wrongly.
+
+## The write path — Phase 7
+
+| Behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `df.write.save(path)` | writes files to a path | **refused** — data lives in Iceberg tables here, so `saveAsTable` is the only way in | ⚠️ |
+| `format(...)` | many | `iceberg` only | ⚠️ |
+| Nullability of a **created** table | inferred from the frame's schema | every field is optional, because the analysed schema comes from DuckDB, which has no non-nullable expression. Writing *into* an existing table is unaffected — PyIceberg validates against the table's own schema | ⚠️ |
+| `insertInto` column matching | by position | by position | ✅ |
+| `partitionBy` on an **existing** table | re-partitions | **ignored** — an existing table's partitioning is its own, and changing it on a write is a much larger act than a write. `Table.update_spec()` is the deliberate way | ⚠️ |
+| `partitionOverwriteMode` default | `static`, which replaces every row | the same. The dangerous one is the default in both, so it is the one you have to *not* ask for | ✅ |
+
+Two upstream limits, measured rather than assumed, each with a characterisation test
+that will fail when it lifts:
+
+| Limit | Detail |
+|---|---|
+| **No streaming writes** | PyIceberg 0.11.1's `Transaction.append` opens `if not isinstance(df, pa.Table): raise ValueError`, so batches and readers are refused and the whole result is materialised. Chunking into several appends would trade atomicity for it, which is the worse deal |
+| **An overwrite is two snapshots** | A `delete` then an `append`, which is how Iceberg models replacing rows — so "one snapshot per write" holds only for appends. Both land in **one transaction**, so no reader sees the table mid-overwrite; the atomicity the goal was after does hold |
+
+## Row-level operations — Phase 8
+
+`DELETE`, `UPDATE` and `MERGE` are **SQL-surface only**, as they are in the reference
+3.5 — there is no `df.delete()` to diverge from. All three are copy-on-write: the rows
+in scope are recomputed and their files rewritten. Emitting delete files instead is
+Phase 13, and decision 11 is why.
+
+| Behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `DELETE FROM t WHERE c` with `c` NULL for a row | the row survives | the row survives — survivors are `NOT COALESCE(c, FALSE)`, not `NOT c` | ✅ |
+| `UPDATE ... SET c = e WHERE p` with `p` NULL | the row is not updated | not updated — `CASE WHEN p THEN e ELSE c END` falls to `ELSE` on NULL | ✅ |
+| Right-hand sides in a multi-column `SET` | all see the row's **old** values | the same — every assignment is a projection of one input row | ✅ |
+| `DELETE ... USING` | supported | **refused**, with a pointer to a subquery in the `WHERE` | ⚠️ |
+| `UPDATE ... FROM` | supported | **refused**, likewise | ⚠️ |
+| `UPDATE t SET s.field = v` | rewrites the one struct field | **refused** — rebuild the struct with `named_struct(...)`. Doing it properly needs the schema-aware `withField` machinery on the SQL surface | 📋 Phase 9 |
+| `MERGE` cardinality violation | raises when one target row matches several source rows | raises — checked **whenever the statement rewrites target rows**, which includes a merge whose only clauses are `WHEN NOT MATCHED BY SOURCE`. The reference documents the check for matched clauses; we have not measured whether it also fires there, so this may be the stricter of the two | ⚠️ |
+| `WHEN NOT MATCHED THEN INSERT (a) VALUES (...)` | unnamed columns get NULL | the same | ✅ |
+| `WHEN NOT MATCHED BY SOURCE ... UPDATE SET *` | refused — there is no source row | refused | ✅ |
+| A source row matching no `WHEN NOT MATCHED` condition | inserts nothing | inserts nothing — not a row of NULLs | ✅ |
+| Snapshots per statement | — | `DELETE` is **one**; `UPDATE` and a rewriting `MERGE` are **two** (a delete then an append) in **one commit**, for the reason recorded under Phase 7 | ⚠️ |
+
+### Two things worth knowing before reading the code
+
+**The predicate is generated in two languages and they must agree row for row.** The
+commit is `Table.overwrite(rows, overwrite_filter=P)`: PyIceberg deletes the rows `P`
+matches, then appends the rows the SQL kept. A `P` wider than the SQL's `WHERE` deletes
+rows that are never written back; a narrower one leaves rows in place *and* appends them
+again. Read pushdown has no such exposure — there the SQL re-applies the filter, so an
+over-wide `P` costs only I/O — which is why `plan/pushdown.py` grew a second, stricter
+gate for this path:
+
+| | Read pushdown | Row-level writes |
+|---|---|---|
+| Requirement on `P` | a **superset** of the SQL's rows | **exactly** the SQL's rows |
+| Gate | `translate_predicate` alone | `translate_predicate` **and** `is_exactly_translatable` |
+| `LIKE 'a%'` | pushed as `StartsWith` | **not** pushed — the two spell escapes differently, and "close enough" is a data-loss bug here |
+| A conjunct that fails the gate | stays in the SQL, prunes less | dropped from *both* forms at once, so the scope widens and the answer does not change |
+
+Both forms come from one set of sqlglot nodes — `scope_predicate` returns the PyIceberg
+expression together with the very nodes it was built from, and those nodes go into the
+`SELECT`'s `WHERE`. They cannot drift because there is no second translation.
+
+**A `MERGE`'s scope comes from the source's own keys.** With no `WHEN NOT MATCHED BY
+SOURCE` clause, a target row can only match if its join key is one the source actually
+holds, so the distinct source keys become an `IN` list and the rewrite touches a few
+files instead of the table. It applies to `integer`, `long`, `string` and `date` keys
+only — a float, decimal or timestamp key is left un-narrowed rather than reasoned about,
+since its SQL literal and its PyIceberg literal are the two things that must agree — and
+it gives up past 1000 distinct values, where binding the list costs more than the pruning
+buys. Giving up always means a wider scope, never a different answer.
+
+## Complex types — Phase 6
+
+Most DuckDB spellings agree with the reference and needed no rule. The ones that did are
+all on **empty input**, which is the case a test over populated data never reaches:
+
+| Behaviour | Reference | DuckDB raw | Rule | Status |
+|---|---|---|---|---|
+| `exists(f)` over an empty list | `false` | `list_bool_or([])` is NULL | three-valued `CASE`: true / NULL when a NULL element is present / false | ✅ |
+| `forall(f)` over an empty list | `true` (vacuously) | `list_bool_and([])` is NULL | the same shape, inverted | ✅ |
+| `aggregate(col, zero, merge)` over an empty list | the zero | `list_reduce` has no initial value and starts from the first element | the zero is **prepended to the list**, which is the same fold | ✅ |
+| `explode` of an empty or NULL collection | no row | `unnest` drops the row | correct as-is; `explode_outer` substitutes `[NULL]` to keep one | ✅ |
+| `posexplode` position | 0-based | `generate_subscripts` is 1-based | one is subtracted | ✅ |
+
+| Behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `map_concat` over differing value types | widens `map<string,int>` to meet `map<string,bigint>` | **refuses** — DuckDB will not merge them. Loud, so it is an error rather than a wrong answer; cast the narrower side | ⚠️ |
+| `schema_of_json` type names | the reference's own (`BIGINT`, `STRING`) | DuckDB's (`UBIGINT`, `VARCHAR`). The *shape* agrees; the type words do not, so the result reads well and does not feed back into `from_json` | ⚠️ |
+| `arrays_zip` field names | named after the input columns | the same, falling back to positions (`"0"`, `"1"`) when two inputs would claim one name. `list_zip` returns an *unnamed* struct, and two unnamed fields cannot be told apart on the way back into Arrow | ⚠️ |
+
+Three implementation notes, invisible from the outside but worth recording:
+
+- **`from_json` is not a `CAST`.** A cast refuses a JSON object carrying a key the
+  target type has no room for; the reference ignores extra keys. DuckDB's `from_json`
+  with a structure argument has the reference's behaviour, so that is what is generated.
+- **`withField` rebuilds the struct.** DuckDB's `struct_insert` *refuses* a field name
+  the struct already has rather than overwriting it, so add-or-replace cannot be one
+  call. The struct is rebuilt from its field list instead — which is also why `withField`
+  and `dropFields` both need the frame's schema.
+- **sqlglot's `Bracket` treats its subscript as 0-based** and adds one for DuckDB, so a
+  literal `p[1]` arrives as `p[2]` and the error names an index the query never
+  mentioned. Positional struct access is spelled `struct_extract(p, 1)` instead. This is
+  carry-over note 12's hazard — a typed node doing something reasonable and unexpected —
+  in a new place.
+
+## Window frames — Phase 5
+
+PLAN.md named frame semantics as the likeliest place for the two engines to drift.
+Probed before building, they **agree on every point**, so no conformance rule was needed:
+
+| Behaviour | Reference | DuckDB | Status |
+|---|---|---|---|
+| Default frame with an ordering | `RANGE UNBOUNDED PRECEDING TO CURRENT ROW` | same | ✅ |
+| Default frame with no ordering | whole partition | same | ✅ |
+| `rank` leaves gaps, `dense_rank` does not | 1,2,2,4 / 1,2,2,3 | same | ✅ |
+| Ranking functions ignore the frame | yes | same | ✅ |
+| `lag`/`lead` offset and default | supported | same | ✅ |
+| `IGNORE NULLS` on value functions | supported | same | ✅ |
+| Null placement inside `OVER (ORDER BY ...)` | nulls first ascending | nulls last | ✅ — the existing `_fix_null_ordering` pass covers it, because a window's ordering is made of the same `exp.Ordered` nodes |
+
+Two behaviours are **SQL's, not divergences**, and are documented on the functions
+because they surprise people rather than because they differ:
+
+| Behaviour | Note |
+|---|---|
+| The default frame is `RANGE`, not `ROWS` | It includes every row tying with the current one, so a running total jumps over a tie rather than climbing through it. The two agree on any column without duplicates, which is what makes shipping the wrong one easy |
+| `last_value` over the default frame returns the **current row** | The frame ends at the current row, so its last value is this one. `rowsBetween(unboundedPreceding, unboundedFollowing)` is the fix. `first_value` looks right only by coincidence — the frame's start really is the partition's start |
+
+| Single-node behaviour | Reference | icetl | Status |
+|---|---|---|---|
+| `monotonically_increasing_id` | monotonic and unique, not consecutive (a partition number is encoded in the high bits) | `row_number() OVER () - 1`, so consecutive here. Relying on that relies on more than either engine promises | ⚠️ |
 
 ## Surface divergences — `Session.sql()` vs `F.*` ⚠️
 

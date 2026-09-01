@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from icetl.errors import EngineValueError
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -421,11 +423,18 @@ class StructType(DataType):
     def needConversion(self) -> bool:
         return any(f.needConversion() for f in self.fields)
 
-    def treeString(self) -> str:
-        """The `printSchema()` rendering, matching the reference engine's layout."""
+    def treeString(self, level: int | None = None) -> str:
+        """The `printSchema()` rendering, matching the reference engine's layout.
+
+        `level` stops the walk after that many levels of nesting, which only becomes
+        useful once a schema *has* nesting -- a struct of structs of arrays prints a
+        page otherwise. Level 1 is the top-level fields; None means all of it.
+        """
+        if level is not None and level < 1:
+            raise EngineValueError(f"treeString() expects level >= 1, got {level}.")
         lines = ["root"]
         for field in self.fields:
-            _tree_field(lines, field.name, field.dataType, field.nullable, " |")
+            _tree_field(lines, field.name, field.dataType, field.nullable, " |", level)
         return "\n".join(lines) + "\n"
 
 
@@ -440,30 +449,56 @@ class StructType(DataType):
 
 
 def _tree_field(
-    lines: list[str], name: str, data_type: DataType, nullable: bool, prefix: str
+    lines: list[str],
+    name: str,
+    data_type: DataType,
+    nullable: bool,
+    prefix: str,
+    depth: int | None = None,
 ) -> None:
     lines.append(f"{prefix}-- {name}: {data_type.treeName()} (nullable = {str(nullable).lower()})")
-    _tree_children(lines, data_type, f"{prefix}    |")
+    _tree_children(lines, data_type, f"{prefix}    |", _deeper(depth))
 
 
 def _tree_labelled(
-    lines: list[str], label: str, data_type: DataType, prefix: str, flag: str, value: bool
+    lines: list[str],
+    label: str,
+    data_type: DataType,
+    prefix: str,
+    flag: str,
+    value: bool,
+    depth: int | None = None,
 ) -> None:
     lines.append(f"{prefix}-- {label}: {data_type.treeName()} ({flag} = {str(value).lower()})")
-    _tree_children(lines, data_type, f"{prefix}    |")
+    _tree_children(lines, data_type, f"{prefix}    |", _deeper(depth))
 
 
-def _tree_children(lines: list[str], data_type: DataType, prefix: str) -> None:
+def _deeper(depth: int | None) -> int | None:
+    """One level further in, or None when no limit was asked for."""
+    return None if depth is None else depth - 1
+
+
+def _tree_children(
+    lines: list[str], data_type: DataType, prefix: str, depth: int | None = None
+) -> None:
+    if depth is not None and depth < 1:
+        return
     if isinstance(data_type, StructType):
         for field in data_type.fields:
-            _tree_field(lines, field.name, field.dataType, field.nullable, prefix)
+            _tree_field(lines, field.name, field.dataType, field.nullable, prefix, depth)
     elif isinstance(data_type, ArrayType):
         _tree_labelled(
-            lines, "element", data_type.elementType, prefix, "containsNull", data_type.containsNull
+            lines,
+            "element",
+            data_type.elementType,
+            prefix,
+            "containsNull",
+            data_type.containsNull,
+            depth,
         )
     elif isinstance(data_type, MapType):
         lines.append(f"{prefix}-- key: {data_type.keyType.treeName()}")
-        _tree_children(lines, data_type.keyType, f"{prefix}    |")
+        _tree_children(lines, data_type.keyType, f"{prefix}    |", _deeper(depth))
         _tree_labelled(
             lines,
             "value",
@@ -471,6 +506,7 @@ def _tree_children(lines: list[str], data_type: DataType, prefix: str) -> None:
             prefix,
             "valueContainsNull",
             data_type.valueContainsNull,
+            depth,
         )
 
 

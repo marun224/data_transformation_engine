@@ -20,7 +20,7 @@ from sqlglot import exp
 
 from icetl.compat import SQL_DIALECT
 from icetl.compat.naming import output_name
-from icetl.errors import EngineTypeError, EngineValueError, UnsupportedFeatureError
+from icetl.errors import EngineTypeError, EngineValueError
 from icetl.plan.builder import as_expression
 from icetl.types import DataType
 
@@ -265,6 +265,47 @@ class Column:
 
     astype = cast
 
+    # -- struct fields -----------------------------------------------------
+
+    def withField(self, fieldName: str, col: Column) -> Column:
+        """This struct with `fieldName` added, or replaced if it is already there.
+
+        Add and replace are one method because the reference makes them one. DuckDB's
+        `struct_insert` cannot do the second half -- it **refuses** a name the struct
+        already carries rather than overwriting it -- so the struct is rebuilt from its
+        field list instead, which needs the frame's schema. `DataFrame.select` resolves
+        it.
+        """
+        from icetl.sql.generators import StructPutColumn
+
+        if not isinstance(fieldName, str) or not fieldName:
+            raise EngineTypeError("withField() needs a non-empty field name.")
+        if not isinstance(col, Column):
+            raise EngineTypeError(f"withField() expects a Column, got {type(col).__name__}.")
+        return StructPutColumn(self._copy(), fieldName, col._copy())
+
+    def dropFields(self, *fieldNames: str) -> Column:
+        """This struct without the named fields.
+
+        DuckDB has no field-removal function, so the struct is **rebuilt** from the ones
+        that remain -- which means the fields have to be known, and they are only known
+        with a frame in hand. `DataFrame.select` resolves it; a `dropFields` used
+        somewhere that cannot resolve a schema raises rather than guessing.
+        """
+        from icetl.sql.generators import StructDropColumn
+
+        names = list(fieldNames)
+        if len(names) == 1 and isinstance(names[0], (list, tuple)):
+            names = list(names[0])
+        if not names:
+            raise EngineValueError("dropFields() needs at least one field name.")
+        for name in names:
+            if not isinstance(name, str):
+                raise EngineTypeError(
+                    f"dropFields() takes field names as strings, got {type(name).__name__}."
+                )
+        return StructDropColumn(self._copy(), names)
+
     # -- ordering ----------------------------------------------------------
 
     def _ordered(self, *, desc: bool, nulls_first: bool | None = None) -> Column:
@@ -430,7 +471,21 @@ class Column:
     # -- deferred ----------------------------------------------------------
 
     def over(self, window: Any) -> Column:
-        raise UnsupportedFeatureError("Column.over()", phase="Phase 5")
+        """Evaluate this expression over `window`.
+
+        Works on any aggregate (`sum(x).over(w)` is a running total) as well as on the
+        ranking and offset functions in `F`. An expression that is neither -- a bare
+        column, say -- produces SQL DuckDB will not bind, and surfaces as an
+        `AnalysisException` when the plan's schema is resolved.
+        """
+        from icetl.sql.window import WindowSpec
+
+        if not isinstance(window, WindowSpec):
+            raise EngineTypeError(
+                f"over() expects a WindowSpec from Window.partitionBy/orderBy, got "
+                f"{type(window).__name__}."
+            )
+        return Column(window._apply(self._expression.copy()))
 
     # -- membership and ranges --------------------------------------------
 

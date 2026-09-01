@@ -8,5 +8,6 @@ from icetl.sql.column import Column
 from icetl.sql.dataframe import DataFrame
 from icetl.sql.session import Session
 from icetl.sql.types import Row
+from icetl.sql.window import Window, WindowSpec
 
-__all__ = ["Column", "DataFrame", "Row", "Session"]
+__all__ = ["Column", "DataFrame", "Row", "Session", "Window", "WindowSpec"]

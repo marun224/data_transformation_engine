@@ -18,14 +18,19 @@ Where DuckDB's behaviour is a defensible choice rather than the only one, icetl 
 **Apache Spark 3.5** as a written specification — `1/0` is NULL, a failed cast is NULL,
 `ORDER BY` puts nulls first ascending. That is a spec reference, not a dependency:
 nothing here runs on, links against, or requires Spark. Every place the two engines
-disagree is recorded in [divergence.md](src/icetl/compat/divergence.md).
+disagree is recorded in [divergence.md](src/icetl/compat/divergence.md), and every place a
+dependency turned out to be wrong is in [FINDINGS.md](FINDINGS.md).
 
 ## Status
 
-**Phases 0–3 complete.** Config and catalog resolution, the DataFrame and SQL
-surfaces, the plan IR with predicate and projection pushdown, and a 273-name function
-library. Phase 4 adds joins, `groupBy().agg()` and set operations. See
-[STATUS.md](STATUS.md).
+**Phases 0–8 complete** — the read side, writing back, and changing rows in place.
+Config and catalog resolution, the DataFrame and SQL surfaces, the plan IR with predicate
+and projection pushdown, a 314-name function library, relational breadth (joins,
+`groupBy().agg()`, grouping sets, set operations, ordering, `na.*`/`stat.*`, caching,
+temporary views), window functions, complex types, the write path — `df.write`,
+`insertInto`, SQL `INSERT`, partitioned creation and dynamic partition overwrite — and
+row-level `DELETE`, `UPDATE` and `MERGE`, the last with the full Spark merge grammar and
+all copy-on-write. Phase 9 adds schema, DDL and snapshots. See [STATUS.md](STATUS.md).
 
 ## Setup
 

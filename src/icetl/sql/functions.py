@@ -43,6 +43,7 @@ __all__ = [
     "acos",
     "acosh",
     "add_months",
+    "aggregate",
     "any",
     "any_value",
     "approx_count_distinct",
@@ -65,6 +66,7 @@ __all__ = [
     "array_sort",
     "array_union",
     "arrays_overlap",
+    "arrays_zip",
     "asc",
     "asc_nulls_first",
     "asc_nulls_last",
@@ -86,6 +88,7 @@ __all__ = [
     "bitwise_not",
     "bool_and",
     "bool_or",
+    "broadcast",
     "btrim",
     "cardinality",
     "cbrt",
@@ -112,7 +115,9 @@ __all__ = [
     "count_if",
     "covar_pop",
     "covar_samp",
+    "create_map",
     "csc",
+    "cume_dist",
     "curdate",
     "current_catalog",
     "current_database",
@@ -135,6 +140,7 @@ __all__ = [
     "dayofweek",
     "dayofyear",
     "degrees",
+    "dense_rank",
     "desc",
     "desc_nulls_first",
     "desc_nulls_last",
@@ -144,33 +150,49 @@ __all__ = [
     "endswith",
     "equal_null",
     "every",
+    "exists",
     "exp",
+    "explode",
+    "explode_outer",
     "expm1",
     "expr",
     "extract",
     "factorial",
+    "filter",
     "find_in_set",
     "first",
+    "first_value",
     "flatten",
     "floor",
+    "forall",
     "format_number",
     "format_string",
+    "from_json",
     "from_unixtime",
     "get",
+    "get_json_object",
     "greatest",
+    "grouping",
+    "grouping_id",
     "hash",
     "hex",
     "hour",
     "hypot",
     "ifnull",
     "initcap",
+    "inline",
+    "inline_outer",
     "instr",
     "isnan",
     "isnull",
+    "json_tuple",
     "kurtosis",
+    "lag",
     "last",
     "last_day",
+    "last_value",
     "lcase",
+    "lead",
     "least",
     "left",
     "length",
@@ -188,6 +210,11 @@ __all__ = [
     "ltrim",
     "make_date",
     "make_timestamp",
+    "map_concat",
+    "map_entries",
+    "map_filter",
+    "map_from_arrays",
+    "map_from_entries",
     "map_keys",
     "map_values",
     "max",
@@ -199,21 +226,27 @@ __all__ = [
     "min_by",
     "minute",
     "mode",
+    "monotonically_increasing_id",
     "month",
     "months_between",
     "nanvl",
     "negative",
     "next_day",
     "now",
+    "nth_value",
+    "ntile",
     "nullif",
     "nvl",
     "nvl2",
     "octet_length",
     "overlay",
+    "percent_rank",
     "percentile",
     "percentile_approx",
     "pi",
     "pmod",
+    "posexplode",
+    "posexplode_outer",
     "positive",
     "pow",
     "power",
@@ -223,6 +256,7 @@ __all__ = [
     "raise_error",
     "rand",
     "randn",
+    "rank",
     "regexp",
     "regexp_count",
     "regexp_extract",
@@ -245,8 +279,10 @@ __all__ = [
     "right",
     "rint",
     "round",
+    "row_number",
     "rpad",
     "rtrim",
+    "schema_of_json",
     "sec",
     "second",
     "sequence",
@@ -286,8 +322,12 @@ __all__ = [
     "timestamp_millis",
     "timestamp_seconds",
     "to_date",
+    "to_json",
     "to_timestamp",
     "to_unix_timestamp",
+    "transform",
+    "transform_keys",
+    "transform_values",
     "translate",
     "trim",
     "trunc",
@@ -312,6 +352,7 @@ __all__ = [
     "width_bucket",
     "xxhash64",
     "year",
+    "zip_with",
 ]
 
 _str = str  # captured before `expr`'s parameter name shadows the builtin
@@ -506,10 +547,20 @@ def _col_obj(value: Any) -> Column:
 
 
 def count(col: Any) -> Column:
-    """`count(*)` when given the string `"*"`, else a non-NULL count of the column."""
-    if col == "*" or (isinstance(col, Column) and isinstance(col._expression, sg.Star)):
-        return Column(sg.Count(this=sg.Star()))
-    return Column(sg.Count(this=_col(col)))
+    """`count(*)` when given the string `"*"` or `F.col("*")`, else a non-NULL count.
+
+    The Column branch is checked **first**, and deliberately: `col == "*"` on a Column
+    builds a comparison *expression*, not a bool, so an `or` over it reaches
+    `Column.__bool__` and raises. Testing the type before the value is what keeps
+    `F.count(F.lit(1))` working.
+    """
+    if isinstance(col, Column):
+        inner = sg.Star() if isinstance(col._expression, sg.Star) else _col(col)
+    elif col == "*":
+        inner = sg.Star()
+    else:
+        inner = _col(col)
+    return Column(sg.Count(this=inner))
 
 
 def countDistinct(*cols: Any) -> Column:
@@ -587,6 +638,656 @@ def collect_list(col: Any) -> Column:
 
 def collect_set(col: Any) -> Column:
     return Column(sg.ArrayUniqueAgg(this=_col(col)))
+
+
+# ---------------------------------------------------------------------------
+# Generators
+# ---------------------------------------------------------------------------
+#
+# These produce more rows than they are given, and sometimes more columns. They are only
+# meaningful inside `select`, which is where they expand -- see `sql/generators.py` for
+# why the expansion cannot happen here.
+
+
+def explode(col: Any) -> Column:
+    """One row per element of a list, or per entry of a map.
+
+    A list yields one column, named `col`. A **map yields two**, named `key` and
+    `value`, which is the reference's shape and the reason this cannot be a plain
+    expression. An empty or NULL collection produces **no row at all**; use
+    `explode_outer` to keep one.
+    """
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.explode(_col(col), outer=False, position=False)
+
+
+def explode_outer(col: Any) -> Column:
+    """`explode`, but an empty or NULL collection still yields one row, of NULLs."""
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.explode(_col(col), outer=True, position=False)
+
+
+def posexplode(col: Any) -> Column:
+    """`explode` with the element's **0-based** index in a leading `pos` column."""
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.explode(_col(col), outer=False, position=True)
+
+
+def posexplode_outer(col: Any) -> Column:
+    """`posexplode`, keeping a NULL row for an empty or NULL collection."""
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.explode(_col(col), outer=True, position=True)
+
+
+def inline(col: Any) -> Column:
+    """Explode an array of structs into one column per struct field."""
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.inline(_col(col), outer=False)
+
+
+def inline_outer(col: Any) -> Column:
+    """`inline`, keeping a NULL row for an empty or NULL array."""
+    from icetl.sql.generators import GeneratorColumn
+
+    return GeneratorColumn.inline(_col(col), outer=True)
+
+
+# ---------------------------------------------------------------------------
+# Maps
+# ---------------------------------------------------------------------------
+
+
+def create_map(*cols: Any) -> Column:
+    """A map from alternating key and value expressions: `create_map(k1, v1, k2, v2)`.
+
+    DuckDB spells a map as two parallel lists rather than an interleaved one, so the
+    arguments are split here into keys and values before being handed over.
+    """
+    items = _flatten_args(cols)
+    if not items:
+        return Column(sg.Anonymous(this="map", expressions=[sg.Array(), sg.Array()]))
+    if len(items) % 2:
+        raise EngineValueError(
+            f"create_map() takes alternating keys and values, so an even number of "
+            f"arguments; got {len(items)}."
+        )
+    keys = [_value(item) for item in items[0::2]]
+    values = [_value(item) for item in items[1::2]]
+    return Column(
+        sg.Anonymous(
+            this="map", expressions=[sg.Array(expressions=keys), sg.Array(expressions=values)]
+        )
+    )
+
+
+def map_from_arrays(keys: Any, values: Any) -> Column:
+    """A map from a list of keys and a list of values, paired positionally."""
+    return _fn("map", _col(keys), _col(values))
+
+
+def map_entries(col: Any) -> Column:
+    """A map as a list of `{key, value}` structs."""
+    return _fn("map_entries", _col(col))
+
+
+def map_from_entries(col: Any) -> Column:
+    """The inverse of `map_entries`."""
+    return _fn("map_from_entries", _col(col))
+
+
+def map_concat(*cols: Any) -> Column:
+    """Several maps merged. Later keys win, as they do in the reference.
+
+    The maps must already agree on their key and value types. The reference widens a
+    `map<string,int>` to meet a `map<string,bigint>`; DuckDB **refuses** the pair
+    instead. It refuses loudly, so the exposure is an error rather than a wrong answer --
+    cast the narrower side. Recorded in `divergence.md`.
+    """
+    items = _flatten_args(cols)
+    if not items:
+        raise EngineValueError("map_concat() needs at least one map.")
+    return _fn("map_concat", *[_col(item) for item in items])
+
+
+def arrays_zip(*cols: Any) -> Column:
+    """Several lists zipped into one list of structs, padded with NULL where short.
+
+    The struct's fields are named after the input columns, as the reference names them,
+    falling back to positions when two inputs would claim the same name. The rename is
+    not cosmetic: `list_zip` returns an *unnamed* struct, and two unnamed fields cannot
+    be told apart on the way back into Arrow.
+    """
+    items = _flatten_args(cols)
+    if not items:
+        raise EngineValueError("arrays_zip() needs at least one array.")
+    nodes = [_col(item) for item in items]
+    names = [
+        item if isinstance(item, _str) else Column(node)._output_name
+        for item, node in zip(items, nodes, strict=True)
+    ]
+    if len(set(names)) != len(names):
+        names = [_str(index) for index in range(len(names))]
+
+    zipped = _fn("list_zip", *nodes)
+    rebuilt = sg.Struct(
+        expressions=[
+            sg.PropertyEQ(
+                this=sg.to_identifier(name, quoted=True),
+                expression=_positional("p", index + 1),
+            )
+            for index, name in enumerate(names)
+        ]
+    )
+    return _fn(
+        "list_transform",
+        zipped._copy(),
+        sg.Lambda(this=rebuilt, expressions=[sg.to_identifier("p")]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Higher-order functions
+# ---------------------------------------------------------------------------
+#
+# Each takes a Python callable and calls it **once**, at plan-building time, with
+# `Column`s standing for the lambda's parameters. What comes back is an expression tree,
+# not a value -- so the callable must be a pure expression builder. A closure that reads
+# a Python variable captures that variable's value at build time, which is the same rule
+# the reference works under.
+#
+# Parameter names are fixed (`x`, `y`, `i`, `acc`) rather than taken from the Python
+# function, so the generated SQL is predictable. They shadow a column of the same name
+# inside the lambda body, exactly as the reference's do.
+
+
+def transform(col: Any, f: Any) -> Column:
+    """Apply `f` to every element. `f` takes the element, or the element and its index."""
+    return _fn("list_transform", _col(col), _lambda("transform", f, ("x", "i")))
+
+
+def filter(col: Any, f: Any) -> Column:
+    """Keep the elements `f` returns true for. `f` takes the element, or element and index."""
+    return _fn("list_filter", _col(col), _lambda("filter", f, ("x", "i")))
+
+
+def exists(col: Any, f: Any) -> Column:
+    """True when `f` holds for at least one element.
+
+    Three-valued, as the reference specifies it: **true** if any element matches,
+    **NULL** if none does but some element is NULL, **false** otherwise -- including for
+    an empty list. DuckDB's `list_bool_or` alone gets the two edges wrong (it ignores
+    NULLs, and answers NULL for an empty list), so the cases are spelled out.
+    """
+    tested = transform(col, f)
+    return Column(
+        sg.Case(
+            ifs=[
+                sg.If(this=_fn("list_bool_or", tested._copy())._copy(), true=sg.true()),
+                sg.If(this=_has_null(tested), true=sg.null()),
+            ],
+            default=sg.false(),
+        )
+    )
+
+
+def forall(col: Any, f: Any) -> Column:
+    """True when `f` holds for every element.
+
+    Three-valued to match `exists`: **false** if any element fails, **NULL** if none
+    fails but some element is NULL, **true** otherwise -- including for an empty list,
+    which is vacuously true.
+    """
+    tested = transform(col, f)
+    passes = _fn("list_bool_and", tested._copy())
+    return Column(
+        sg.Case(
+            ifs=[
+                sg.If(this=sg.EQ(this=passes._copy(), expression=sg.false()), true=sg.false()),
+                sg.If(this=_has_null(tested), true=sg.null()),
+            ],
+            default=sg.true(),
+        )
+    )
+
+
+def _has_null(tested: Column) -> sg.Expression:
+    """True when the tested list holds at least one NULL."""
+    nulls = _fn(
+        "list_filter",
+        tested._copy(),
+        sg.Lambda(
+            this=sg.Is(this=sg.column("x"), expression=sg.Null()),
+            expressions=[sg.to_identifier("x")],
+        ),
+    )
+    return sg.GT(this=_fn("len", nulls._copy())._copy(), expression=sg.Literal.number("0"))
+
+
+def aggregate(col: Any, initialValue: Any, merge: Any, finish: Any = None) -> Column:
+    """Fold `merge` over the list, starting from `initialValue`.
+
+    DuckDB's `list_reduce` has no initial value of its own -- it starts from the first
+    element -- so the zero is **prepended to the list** instead. That is the same
+    computation, and it is also what makes an empty list return the zero rather than
+    NULL, which is the behaviour the reference specifies.
+    """
+    seeded = _fn("list_prepend", _value(initialValue), _col(col))
+    folded = _fn("list_reduce", seeded._copy(), _lambda("aggregate", merge, ("acc", "x")))
+    if finish is None:
+        return folded
+    return _apply_lambda("aggregate", finish, folded)
+
+
+def zip_with(left: Any, right: Any, f: Any) -> Column:
+    """Pair the two lists positionally and apply `f` to each pair."""
+    zipped = _fn("list_zip", _col(left), _col(right))
+    paired = _lambda_over_pair("zip_with", f)
+    return _fn("list_transform", zipped._copy(), paired)
+
+
+def transform_keys(col: Any, f: Any) -> Column:
+    """Rebuild the map with `f(key, value)` as each key."""
+    return _map_rebuild("transform_keys", col, f, replace="key")
+
+
+def transform_values(col: Any, f: Any) -> Column:
+    """Rebuild the map with `f(key, value)` as each value."""
+    return _map_rebuild("transform_values", col, f, replace="value")
+
+
+def map_filter(col: Any, f: Any) -> Column:
+    """Keep the entries `f(key, value)` returns true for."""
+    entries = _fn("map_entries", _col(col))
+    body = _entry_lambda("map_filter", f)
+    kept = _fn("list_filter", entries._copy(), body)
+    return _fn("map_from_entries", kept._copy())
+
+
+def _lambda(name: _str, f: Any, names: tuple[_str, ...]) -> sg.Expression:
+    """Build `x -> body`, passing as many parameters as `f` declares."""
+    count = _arity(name, f, len(names))
+    parameters = names[:count]
+    arguments = [Column(sg.column(parameter)) for parameter in parameters]
+    body = _lambda_body(name, f, arguments)
+    return sg.Lambda(this=body, expressions=[sg.to_identifier(p) for p in parameters])
+
+
+def _lambda_over_pair(name: _str, f: Any) -> sg.Expression:
+    """`zip_with`'s lambda: DuckDB hands one struct per pair, the reference two values."""
+    _arity(name, f, 2, exact=2)
+    # `list_zip` yields an *unnamed* struct, which has no field names to reach for --
+    # so each half is taken by position instead. `struct_extract` rather than `p[1]`:
+    # sqlglot's `Bracket` assumes a 0-based subscript and adds one for DuckDB, so a
+    # literal 1 arrives as 2 (carry-over note 12's hazard, in a new place).
+    left = Column(_positional("p", 1))
+    right = Column(_positional("p", 2))
+    body = _lambda_body(name, f, [left, right])
+    return sg.Lambda(this=body, expressions=[sg.to_identifier("p")])
+
+
+def _entry_lambda(name: _str, f: Any) -> sg.Expression:
+    """A `(key, value)` lambda over DuckDB's `{key, value}` entry structs."""
+    _arity(name, f, 2, exact=2)
+    entry = sg.column("e")
+    key = Column(sg.Dot(this=entry.copy(), expression=sg.to_identifier("key")))
+    value = Column(sg.Dot(this=entry.copy(), expression=sg.to_identifier("value")))
+    body = _lambda_body(name, f, [key, value])
+    return sg.Lambda(this=body, expressions=[sg.to_identifier("e")])
+
+
+def _map_rebuild(name: _str, col: Any, f: Any, replace: _str) -> Column:
+    """Rewrite one half of every entry, then rebuild the map from the entries."""
+    _arity(name, f, 2, exact=2)
+    entry = sg.column("e")
+    key = Column(sg.Dot(this=entry.copy(), expression=sg.to_identifier("key")))
+    value = Column(sg.Dot(this=entry.copy(), expression=sg.to_identifier("value")))
+    replacement = _lambda_body(name, f, [key, value])
+    fields = {
+        "key": replacement if replace == "key" else key._copy(),
+        "value": replacement if replace == "value" else value._copy(),
+    }
+    rebuilt = sg.Struct(
+        expressions=[
+            sg.PropertyEQ(this=sg.to_identifier(field), expression=node)
+            for field, node in fields.items()
+        ]
+    )
+    mapped = _fn(
+        "list_transform",
+        _fn("map_entries", _col(col))._copy(),
+        sg.Lambda(this=rebuilt, expressions=[sg.to_identifier("e")]),
+    )
+    return _fn("map_from_entries", mapped._copy())
+
+
+def _apply_lambda(name: _str, f: Any, argument: Column) -> Column:
+    """Call a single-argument builder on an expression that is already built."""
+    _arity(name, f, 1, exact=1)
+    return Column(_lambda_body(name, f, [argument]))
+
+
+def _arity(name: _str, f: Any, most: int, exact: int | None = None) -> int:
+    """How many parameters `f` declares, refusing anything the function cannot supply."""
+    import inspect
+
+    if not callable(f):
+        raise EngineTypeError(f"{name}() expects a function, got {type(f).__name__}.")
+    try:
+        count = len(inspect.signature(f).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - builtins without a signature
+        count = exact or 1
+    if exact is not None:
+        if count != exact:
+            raise EngineValueError(
+                f"{name}()'s function takes {exact} argument(s), got one taking {count}."
+            )
+        return count
+    if not 1 <= count <= most:
+        raise EngineValueError(
+            f"{name}()'s function takes 1 to {most} argument(s), got one taking {count}."
+        )
+    return count
+
+
+def _lambda_body(name: _str, f: Any, arguments: list[Column]) -> sg.Expression:
+    result = f(*arguments)
+    if not isinstance(result, Column):
+        raise EngineTypeError(
+            f"{name}()'s function must return a Column, got {type(result).__name__}. "
+            f"It is called once to build an expression, not once per row."
+        )
+    return result._copy()
+
+
+def _positional(variable: _str, index: int) -> sg.Expression:
+    """The `index`-th field of an unnamed struct, counting from 1.
+
+    Spelled as `struct_extract` rather than `p[index]` because sqlglot's `Bracket`
+    treats its subscript as 0-based and adds one on the way to DuckDB -- so a literal 1
+    arrives as 2, and the error names an index the query never mentioned.
+    """
+    return sg.Anonymous(
+        this="struct_extract",
+        expressions=[sg.column(variable), sg.Literal.number(_str(index))],
+    )
+
+
+def _flatten_args(cols: tuple[Any, ...]) -> list[Any]:
+    """Accept both `f(a, b)` and `f([a, b])`, as the reference does."""
+    items = list(cols)
+    if len(items) == 1 and isinstance(items[0], (list, tuple)):
+        return list(items[0])
+    return items
+
+
+# ---------------------------------------------------------------------------
+# JSON
+# ---------------------------------------------------------------------------
+
+
+def get_json_object(col: Any, path: _str) -> Column:
+    """Extract `path` from a JSON string, as text.
+
+    The path is the reference's `$.a.b` spelling, which is also DuckDB's. A scalar comes
+    back unquoted and an object or array comes back as its JSON text, which is what the
+    reference does too.
+    """
+    if not isinstance(path, _str):
+        raise EngineTypeError(
+            f"get_json_object() expects a path string, got {type(path).__name__}."
+        )
+    return _fn("json_extract_string", _col(col), sg.Literal.string(path))
+
+
+def json_tuple(col: Any, *fields: _str) -> Column:
+    """Several top-level JSON fields at once, one output column each.
+
+    A generator in the reference, and one here too: `select(json_tuple(j, "a", "b"))`
+    produces two columns rather than one. Unlike `explode` it adds no rows.
+    """
+    from icetl.sql.generators import GeneratorColumn
+
+    names = _flatten_args(fields)
+    if not names:
+        raise EngineValueError("json_tuple() needs at least one field name.")
+    for field in names:
+        if not isinstance(field, _str):
+            raise EngineTypeError(
+                f"json_tuple() expects field names as strings, got {type(field).__name__}."
+            )
+    return GeneratorColumn.json_tuple(_col(col), [_str(field) for field in names])
+
+
+def to_json(col: Any) -> Column:
+    """A struct, list or map rendered as a JSON string."""
+    return _fn("to_json", _col(col))
+
+
+def from_json(col: Any, schema: Any) -> Column:
+    """Parse a JSON string into the structure `schema` describes.
+
+    `schema` is a DDL string (`"a bigint, b string"`) or a `StructType`. Keys the schema
+    does not mention are **ignored** rather than an error, which is the reference's
+    behaviour -- and the reason this is `from_json` rather than a plain `CAST`, which
+    refuses a JSON object carrying a key the target type has no room for.
+    """
+    from icetl.parse_types import parse_struct_ddl
+    from icetl.types import DataType, StructType
+
+    if isinstance(schema, _str):
+        parsed: DataType = parse_struct_ddl(schema)
+    elif isinstance(schema, DataType):
+        parsed = schema
+    else:
+        raise EngineTypeError(
+            f"from_json() expects a DDL string or a StructType, got {type(schema).__name__}."
+        )
+    if not isinstance(parsed, StructType):
+        raise EngineValueError("from_json() needs a struct schema.")
+    structure = sg.Literal.string(_json_dumps(_json_structure(parsed)))
+    return _fn("from_json", sg.Cast(this=_col(col), to=sg.DataType.build("JSON")), structure)
+
+
+def schema_of_json(col: Any) -> Column:
+    """The DDL of the structure a JSON string implies.
+
+    DuckDB reports its own type names (`UBIGINT`, `VARCHAR`) where the reference reports
+    its own (`BIGINT`, `STRING`), so the *shape* agrees and the type words do not. The
+    difference is recorded in `divergence.md`; the useful form of this function is
+    passing its result to a human, not to `from_json`.
+    """
+    return _fn("json_structure", sg.Cast(this=_col(col), to=sg.DataType.build("JSON")))
+
+
+def _json_structure(data_type: Any) -> Any:
+    """A reference type as the nested structure DuckDB's `from_json` wants."""
+    from icetl.types import ArrayType, StructType
+
+    if isinstance(data_type, StructType):
+        return {field.name: _json_structure(field.dataType) for field in data_type.fields}
+    if isinstance(data_type, ArrayType):
+        return [_json_structure(data_type.elementType)]
+    # Rendered through sqlglot rather than mapped by hand, so the reference's spelling
+    # and DuckDB's stay in step with the same table `cast()` uses.
+    return sg.DataType.build(data_type.simpleString(), dialect=SQL_DIALECT).sql(dialect="duckdb")
+
+
+def _json_dumps(value: Any) -> _str:
+    import json
+
+    return json.dumps(value)
+
+
+# ---------------------------------------------------------------------------
+# Window functions
+# ---------------------------------------------------------------------------
+#
+# Everything here is meaningless without an `OVER` clause, so each is written to be
+# handed straight to `Column.over(...)`. The five ranking functions take no arguments
+# and **ignore the frame** -- a rank is a property of the ordering, not of a window of
+# rows -- which is why `rowsBetween` beside a `rank()` changes nothing.
+
+
+def row_number() -> Column:
+    """A distinct 1-based number per row, in the window's order. Never ties."""
+    return Column(sg.RowNumber())
+
+
+def rank() -> Column:
+    """1-based rank, **leaving gaps** after a tie: 1, 2, 2, 4."""
+    return Column(sg.Anonymous(this="rank"))
+
+
+def dense_rank() -> Column:
+    """1-based rank with **no gaps** after a tie: 1, 2, 2, 3."""
+    return Column(sg.Anonymous(this="dense_rank"))
+
+
+def percent_rank() -> Column:
+    """`(rank - 1) / (rows - 1)`, so the first row is 0.0 and the last is 1.0."""
+    return Column(sg.Anonymous(this="percent_rank"))
+
+
+def cume_dist() -> Column:
+    """The fraction of rows at or before this one in the ordering."""
+    return Column(sg.Anonymous(this="cume_dist"))
+
+
+def ntile(n: int = 1) -> Column:
+    """Split each partition into `n` buckets as evenly as it can, numbered from 1."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise EngineTypeError(f"ntile() expects an int, got {type(n).__name__}.")
+    if n < 1:
+        raise EngineValueError(f"ntile() expects n >= 1, got {n}.")
+    return Column(sg.Anonymous(this="ntile", expressions=[sg.Literal.number(_str(n))]))
+
+
+def lag(col: Any, offset: int = 1, default: Any = None) -> Column:
+    """The value `offset` rows earlier in the window, or `default` past the start."""
+    return _offset_function(sg.Lag, "lag", col, offset, default)
+
+
+def lead(col: Any, offset: int = 1, default: Any = None) -> Column:
+    """The value `offset` rows later in the window, or `default` past the end."""
+    return _offset_function(sg.Lead, "lead", col, offset, default)
+
+
+def _offset_function(node: Any, name: _str, col: Any, offset: int, default: Any) -> Column:
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise EngineTypeError(f"{name}() expects offset as an int, got {type(offset).__name__}.")
+    arguments: dict[_str, Any] = {"this": _col(col), "offset": sg.Literal.number(_str(offset))}
+    if default is not None:
+        arguments["default"] = to_literal(default)
+    return Column(node(**arguments))
+
+
+def nth_value(col: Any, offset: int, ignoreNulls: bool = False) -> Column:
+    """The `offset`-th value in the window, counting from 1.
+
+    NULL until the window holds that many rows, which is what makes it different from
+    indexing a collected list.
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise EngineTypeError(f"nth_value() expects offset as an int, got {type(offset).__name__}.")
+    if offset < 1:
+        raise EngineValueError(f"nth_value() counts from 1, got {offset}.")
+    value = sg.NthValue(this=_col(col), offset=sg.Literal.number(_str(offset)))
+    return Column(_ignore_nulls(value, ignoreNulls))
+
+
+def first_value(col: Any, ignoreNulls: bool = False) -> Column:
+    """The first value in the window frame.
+
+    Note *frame*, not partition: with an ordering and no explicit frame the default is
+    `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`, and the first value of that is the first
+    of the partition -- but `last_value` over the same default is the **current row**,
+    not the last of the partition. That surprise is SQL's, and the reference has it too;
+    `rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)` is the fix.
+    """
+    return Column(_ignore_nulls(sg.FirstValue(this=_col(col)), ignoreNulls))
+
+
+def last_value(col: Any, ignoreNulls: bool = False) -> Column:
+    """The last value in the window **frame** -- see `first_value` for why that matters."""
+    return Column(_ignore_nulls(sg.LastValue(this=_col(col)), ignoreNulls))
+
+
+def _ignore_nulls(value: sg.Expression, ignore: bool) -> sg.Expression:
+    if not isinstance(ignore, bool):
+        raise EngineTypeError(f"ignoreNulls expects a bool, got {type(ignore).__name__}.")
+    return sg.IgnoreNulls(this=value) if ignore else value
+
+
+def monotonically_increasing_id() -> Column:
+    """A unique, increasing id per row, starting at 0.
+
+    The reference only promises monotonic and unique, not consecutive -- it encodes a
+    partition number in the high bits. Here there is one partition, so the ids come out
+    consecutive. Anything relying on that is relying on more than either engine
+    guarantees.
+
+    Already a window function, so it takes no `.over()`.
+    """
+    numbered = sg.Window(this=sg.RowNumber(), over="OVER")
+    return Column(sg.Sub(this=numbered, expression=sg.Literal.number("1")))
+
+
+# ---------------------------------------------------------------------------
+# Grouping sets
+# ---------------------------------------------------------------------------
+
+
+def grouping(col: Any) -> Column:
+    """1 when `col` was rolled up in this row, 0 when it is a real grouping key.
+
+    The answer to `rollup`/`cube`'s one ambiguity: a rolled-up key comes back as NULL,
+    and so does a NULL in the data. Only `grouping` tells the two apart. Valid only in
+    a query that groups by a rollup, cube or grouping set.
+    """
+    return _fn("grouping", _col(col))
+
+
+def grouping_id(*cols: Any) -> Column:
+    """The grouping level as a bit vector over `cols`, most significant first.
+
+    `grouping_id(a, b)` is `2*grouping(a) + grouping(b)`: 0 where both are real keys,
+    3 on the grand total row.
+
+    The reference engine allows a bare `grouping_id()` meaning "every grouping column",
+    but nothing in this namespace can see what the query groups by -- and DuckDB has no
+    such spelling either -- so the columns must be named rather than guessed at.
+    """
+    if not cols:
+        raise EngineValueError(
+            "grouping_id() needs the columns named, e.g. F.grouping_id('a', 'b'). "
+            "The no-argument form means 'every grouping column', which this namespace "
+            "cannot see."
+        )
+    return _fn("grouping_id", *[_col(c) for c in cols])
+
+
+def broadcast(df: Any) -> Any:
+    """A no-op that returns `df` unchanged.
+
+    In the reference engine this hints that a frame is small enough to ship to every
+    executor. There are no executors here -- everything runs in one process against one
+    DuckDB connection -- so there is nothing to hint at and nothing to be gained. It
+    exists so a script written against the reference engine runs unaltered rather than
+    failing on an import.
+
+    Unlike everything else in this module it takes and returns a **DataFrame**, not a
+    Column; that is the reference's signature, not a slip.
+    """
+    from icetl.sql.dataframe import DataFrame
+
+    if not isinstance(df, DataFrame):
+        raise EngineTypeError(f"broadcast() expects a DataFrame, got {type(df).__name__}.")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -941,11 +1642,19 @@ def size(col: Any) -> Column:
 
 
 def struct(*cols: Any) -> Column:
-    """A struct whose field names are the column names, as the reference engine does."""
+    """A struct whose field names are the column names, as the reference engine does.
+
+    An aliased column names the field and then **loses the alias**: the name belongs to
+    the struct entry, and leaving it on the value too emits `{'a': 1 AS "a"}`, which is
+    not SQL. `F.struct(F.lit(1).alias("a"))` is the spelling that found it.
+    """
+    items = _flatten_args(cols)
     fields: list[sg.Expression] = []
-    for item in cols:
+    for item in items:
         node = _col(item)
         name = item if isinstance(item, _str) else Column(node)._output_name
+        if isinstance(node, sg.Alias):
+            node = as_expression(node.this)
         fields.append(sg.PropertyEQ(this=sg.to_identifier(name, quoted=True), expression=node))
     return Column(sg.Struct(expressions=fields))
 
