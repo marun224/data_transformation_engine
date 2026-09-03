@@ -240,6 +240,7 @@ __all__ = [
     "nvl2",
     "octet_length",
     "overlay",
+    "pandas_udf",
     "percent_rank",
     "percentile",
     "percentile_approx",
@@ -334,6 +335,7 @@ __all__ = [
     "try_divide",
     "try_to_timestamp",
     "ucase",
+    "udf",
     "unbase64",
     "unhex",
     "unix_date",
@@ -3213,3 +3215,15 @@ def get(col: Any, index: Any) -> Column:
         _col(col),
         sg.Paren(this=sg.Add(this=_col(index), expression=to_literal(1))),
     )
+
+
+# ---------------------------------------------------------------------------
+# User-defined functions -- Phase 11
+# ---------------------------------------------------------------------------
+
+# Re-exported rather than defined here: a UDF needs a *session* to register against,
+# which nothing else in this module does. `sql/udf.py` owns that, and owns the two
+# things about it that are easy to get wrong -- registering on the analyzer's
+# connection as well as the engine's, and calling the function with NULL as the
+# reference does.
+from icetl.sql.udf import pandas_udf, udf  # noqa: E402

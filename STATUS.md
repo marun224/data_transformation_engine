@@ -7,103 +7,157 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-09-01, at the end of Phase 9. Phase 10 (performance & scale) is next
-and is not started.
+**Paused:** 2026-09-02, at the end of Phase 11. Every phase PLAN.md scheduled is done;
+what remains is deferred by decision.
 
 ### Where things stand
 
 | | |
 |---|---|
-| Phases 0–9 | **done**, green |
+| Phases 0–11 | **done**, green |
 | Phases 12, 13, 14, 15 | **deferred by decision**, each with its own section in PLAN.md §4 |
 | ⚠️ Live gap | `weekday`/`dayofweek` are off by one through `Session.sql()` — **use `F.*` for date parts** until Phase 15 |
-| Decision 15 | **done** — the PySpark compat surface is removed; see the section below |
-| Tests | 1426 local, 11 integration |
+| Tests | 1679 local, 11 integration |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
+| Benchmarks | [BENCHMARKS.md](BENCHMARKS.md), tracked; re-run and commit the diff when the read path changes |
+| Docs | [GUIDE.md](GUIDE.md) and [notebooks/00_quickstart.ipynb](notebooks/00_quickstart.ipynb) |
 
 ### Committed
 
 | Commit | What |
 |---|---|
 | `92efdb8` | *"Initial commit: icetl through Phase 3 (in progress)"* — 85 files, 16,408 lines |
-| `26c792d` | *"code refactoring"* — 66 files, +5,649/−1,460. Phase 3's completion (the third `F.*` tranche, the optimizer's `ArithmeticError` fix), decision 15's rename, `tox.ini`, and the notebooks |
+| `26c792d` | *"code refactoring"* — Phase 3's completion, decision 15's rename, `tox.ini`, the notebooks |
 | `dcb2739` | *"phase 4 chnages are committed"* — `groupBy().agg()` and joins |
-| `8c5b945` | *"Phase 8 changes"* — 32 files, +9,630/−118. The rest of Phase 4 and the whole of Phases 5, 6, 7 and 8, plus `FINDINGS.md` |
+| `8c5b945` | *"Phase 8 changes"* — the rest of Phase 4 and all of Phases 5–8, plus `FINDINGS.md` |
+| `4a9a8a3` | *"phase 9 changes"* — `session.catalog.*`, SQL DDL, time travel, metadata tables |
 
-> ⚠️ **Phase 9 is staged, not committed.** Everything through Phase 8 is in `8c5b945`.
-> Phase 9 is in the index — 17 files, 4 of them new — with nothing untracked, so
-> `git clean` is safe, but the work exists in exactly one place. `git status` first;
-> committing it is the first thing to do.
+### Uncommitted — Phases 10 and 11
+
+**Both phases are in the working tree**, green against the full gate but in exactly one
+place. Committing them is the first thing to do.
+
+> ⚠️ **Seven files are partially staged**, left over from a `git stash` cycle during
+> Phase 10. `git commit` **without** `-a` would commit half-versions of them —
+> `session.py` without the UDF registration and `maintenance()`, `analysis.py` without
+> `invalidate()` — and the result would not import, let alone pass. Check with
+> `git status --short` and look for `MM`:
+>
+> ```
+> FINDINGS.md  PLAN.md  README.md  STATUS.md
+> src/icetl/compat/divergence.md  src/icetl/plan/analysis.py  src/icetl/sql/session.py
+> ```
+>
+> `git add -A` first, or `git commit -a`. Then re-run `uv run tox` — if it passes on
+> the tree it will pass on the commit.
+
+**New — Phase 10** (performance):
+
+| | |
+|---|---|
+| `src/icetl/plan/counting.py` | `count(*)` recognised and answered from manifests |
+| `src/icetl/plan/cardinality.py` | which plan nodes multiply rows, and the optimizer guard |
+| `src/icetl/diagnostics/benchmark.py` · `scripts/benchmark.py` | the benchmark harness |
+| `BENCHMARKS.md` | the committed numbers, and how to read a regression |
+| 6 test files | `test_count`, `test_streaming`, `test_explain_bytes`, `test_engine_memory`, `test_schema_cache`, `test_generator_cardinality` |
+
+**New — Phase 11** (extras):
+
+| | |
+|---|---|
+| `src/icetl/sql/udf.py` | UDF registration, both surfaces, and the null-handling guard |
+| `src/icetl/io/maintenance.py` | `compact()`, `expireSnapshots()`, `removeOrphanFiles()` |
+| `GUIDE.md` · `notebooks/00_quickstart.ipynb` | the user guide and the runnable tour |
+| 3 test files | `test_udf`, `test_maintenance`, `test_file_readers` |
+
+**Modified**, and the reason each was touched:
+
+| file | why |
+|---|---|
+| `plan/pushdown.py` | `join_predicates` (§3.5), and `_from_table` — the `from_` key bug behind §1.12 |
+| `plan/optimizer.py` | skips three rules when a plan holds a generator (§1.13) |
+| `plan/analysis.py` | the schema cache and `invalidate()` |
+| `exec/scan_planner.py` | `records`, `bytes_total`, per-column byte accounting (§3.3) |
+| `exec/engine.py` | `record_batches` and the stale-stream guard |
+| `sql/session.py` | metadata count, `_stream`, `session.udf`, `session.maintenance` |
+| `sql/dataframe.py` | `toArrowBatches`, `toLocalIterator` |
+| `sql/reader.py` | `parquet` / `csv` / `json` / `load` |
+| `sql/functions.py` | re-exports `udf` and `pandas_udf` |
+| `sql/writer.py` | translates the Windows encoding failure (§2.10) |
+| 4 test files | pins updated where a fix landed, plus the §2.10 tests |
+
+About **3,500 added lines** across 30 tracked files, plus the new ones — roughly
+1,700 lines of source and 2,000 of tests.
 
 ### Picking it back up
 
-Prerequisites: the REST catalog on `localhost:8182` and MinIO on `localhost:9100`
-must be running for the integration tests. `.env` holds the settings and is
-gitignored; `.env.example` documents every key. Local tests need neither.
+Prerequisites: the REST catalog on `localhost:8182` and MinIO on `localhost:9100` must
+be running for the integration tests. `.env` holds the settings and is gitignored;
+`.env.example` documents every key. Local tests need neither.
 
 ```bash
 uv sync --extra dev            # if the venv is cold
-uv run tox                     # the whole gate: lint, mypy, 1426 tests, then dist/
-uv run pytest -q               # 1426 expected, if you want just the tests
+uv run tox                     # the whole gate: lint, mypy, 1679 tests, then dist/
+uv run pytest -q               # 1679 expected, if you want just the tests
 uv run pytest -m integration -q # 11 expected; needs the catalog up
-uv run ruff check . && uv run ruff format --check . && uv run mypy .
 uv run python scripts/smoke_catalog.py -v   # proof of life against the real catalog
+uv run python scripts/benchmark.py          # the wide-table benchmark suite
 ```
 
 ### The next thing to do
 
-**Phases 4 through 9 are complete.** The read side, writing back, changing rows in place,
-and now the catalog itself: `session.catalog.*`, `CREATE`/`ALTER`/`DROP TABLE` and
-namespaces, partition-spec and sort-order evolution, `mergeSchema`, time travel, and
-Iceberg's metadata tables.
+**Every phase PLAN.md scheduled is complete.** The read side, writing back, changing
+rows in place, the catalog, performance, and now UDFs, table maintenance, file readers
+and the documentation.
 
-**Next: Phase 10 — performance & scale.** DuckDB `memory_limit` and spill sized from
-available RAM, threads from physical cores, a wide-table benchmark harness against the
-200-column fixture and then the real table, result streaming so a large result never
-OOMs, a query cache, and benchmarks committed as a tracked file so regressions are
-visible.
+What is left is the four phases deferred **by decision**, each with its own section in
+PLAN.md §4 and its own reason:
 
-Four things from Phase 9 to carry into it, three of them already measured:
+| | | |
+|---|---|---|
+| **Phase 12** | merge-on-read **reads** | Decision 11. `exec/scan_planner.py` already refuses such a table rather than returning deleted rows — the day an upstream writer switches, queries start failing loudly and this is what unblocks them. **The most likely to become urgent without warning.** |
+| **Phase 13** | merge-on-read **writes** | Decision 11, further out. Needs 12 first. |
+| **Phase 14** | decimal promotion | Decision 14. `*` differs in precision and `/` returns `DOUBLE`. No guard is possible — detecting it costs the same as fixing it. |
+| **Phase 15** | SQL-surface function resolution | Decision 16, and the one **live wrong answer** in the codebase: `weekday`/`dayofweek` differ between surfaces, silently. |
 
-- **`explain()`'s `bytes_scanned` ignores column pruning** (FINDINGS §3.3) and an
-  **unfiltered `count(*)` opens parquet footers** Iceberg's manifests could answer
-  (§3.4). Both are Phase 10's, and both are already written down with numbers.
-- **An inner join's `WHERE` conjunct is folded into the `ON` clause and stops pruning**
-  (§3.5, found in Phase 9). `extract_scan_requests` reads only the scope's `WHERE`;
-  reading the `ON` clause too is the fix, and `TestOuterJoinsAreNotPrunedByTheirOwnNullChecks`
-  already pins the measurement so a change is visible.
-- **Pruning is safe except under an outer join** (§1.10). Whatever Phase 10 adds to
-  pushdown has to pass through `is_null_rejecting` for a null-padded table, or it
-  reintroduces the anti-join bug in a new place.
+**If picking one, Phase 15.** It is the only item on the list that is currently giving a
+wrong answer rather than refusing, it is bounded — a resolution hook plus an exhaustive
+both-surfaces test — and P1 ("the two surfaces are one code path") does not actually
+hold until it is done.
 
-Still open from Phase 9 itself: `ALTER COLUMN ... TYPE` is refused because PyIceberg 0.11
-exposes no type update, and nested-field assignment (`UPDATE t SET s.field = v`) is still
-refused — it wants the schema-aware `withField` machinery on the SQL surface, which
-neither Phase 8 nor Phase 9 needed to build.
+Four things to carry into whatever comes next:
 
-PLAN.md §4 has the full phase list, and [FINDINGS.md](FINDINGS.md) has every trap found so
-far — worth ten minutes before writing anything that generates SQL.
+- **A generator is not a scalar expression** (FINDINGS §1.13). `plan/cardinality.py`
+  lists the row-multiplying nodes and three optimizer rules are skipped when one is
+  present. **Anything added to `sql/generators.py` must be added to that list**, or the
+  optimizer will quietly drop it.
+- **Pruning is safe only under `is_null_rejecting`** for a null-padded table (§1.10,
+  §1.12), and §1.12 was that same bug reached through `RIGHT JOIN` — so a new pushdown
+  path needs testing against every join spelling, not one.
+- **`collect()` on a wide result is 95% `Row` building** (§3.8). Reach for `toArrow()`.
+- **The two-surface habit.** `count()` disagreed with `len(collect())` for two phases
+  because every test asked one question.
 
-The SQL-surface function gap found at the end of Phase 3 is **deferred to Phase 15**
-(decision 16) — it is documented, not forgotten. One thing to carry while working:
-`weekday`/`dayofweek` answer differently through `Session.sql()` than through `F.*`, so
-reach for `F.*` on date parts.
+PLAN.md §4 has the full phase list, [FINDINGS.md](FINDINGS.md) has every trap found so
+far, and [GUIDE.md](GUIDE.md) is the user-facing tour.
 
-The `F.*` surface finished at 273 names, each with a value-level test. What is missing
-from it belongs to later phases by design, not by omission:
-
-| What is left | Owner |
-|---|---|
-| JSON, `map_*`, `explode`, higher-order (`transform`, `filter`, `aggregate`, `zip_with`), `arrays_zip`, nested field access | **Phase 6** |
-| `monotonically_increasing_id`, `first_value`/`last_value` as window forms, everything reached through `Column.over` | **Phase 5** |
-| `grouping`, `grouping_id`, `broadcast` | **Phase 4** |
-| Twelve functions with no faithful DuckDB spelling — `crc32`, `soundex`, `typeof`, `try_add` and the rest | each with its reason in `divergence.md` |
-
-The rule that governed all of this still governs the next phase:
+The rule that governed every phase still governs the next one:
 
 > Every function needs a test that asserts on a **value**, not on generated SQL.
 > Around a dozen of the first 169 produced perfectly plausible SQL and the wrong
 > answer. `tests/fixture/test_functions.py` opens with why.
+
+Phase 10 added a second, at some cost:
+
+> **Ask the same frame two different questions and compare the answers.** `count()`
+> returned 5 where `collect()` returned 15 for two whole phases, because every test
+> asked one question.
+
+And Phase 11 a third:
+
+> **Run the documentation.** Every cell of the quickstart was executed rather than
+> written and hoped for, and that is what found FINDINGS §2.10 — a schema mismatch
+> reporting a codec error instead of itself, on every Windows console.
 
 ---
 
@@ -1327,6 +1381,260 @@ the text to that grammar before letting the parse error stand.
 
 ---
 
+## Phase 10 — Performance & scale · **DONE** (2026-09-02)
+
+Sizing, streaming, and the three performance findings the earlier phases had measured
+and left. The phase is unusual in that **two of its five deliverables were settled by
+deciding not to build them**, and in that looking for a fast `count(*)` turned up two
+silent wrong answers that had nothing to do with performance.
+
+### The three carried findings, closed
+
+| | Was | Now |
+|---|---|---|
+| §3.5 | An inner join's `WHERE` conjunct folded into `ON` pruned **3 of 3** files where the `LEFT JOIN` spelling pruned 1 | `join_predicates` reads the `ON` clause for the side the join *filters*; both spellings prune to 1 |
+| §3.4 | An unfiltered `count(*)` opened a parquet footer per file | Answered from the manifest sum: **0.042 s** against a 1.3 s full scan, opening no file at all |
+| §3.3 | `bytes_scanned` reported the selected *files'* size, so 2 of 200 columns looked as expensive as 200 | A sum over the selected columns, printed beside the file total, at a readable scale |
+
+The §3.5 fix is the one with a sharp edge. An `ON` conjunct is a filter on the side the
+join does **not preserve** — both sides of an inner join, the right of a `LEFT`, the
+left of a `RIGHT`, neither of a `FULL` — and on that side it applies to rows read from
+the table before any null-padding, so it needs no `is_null_rejecting` gate. On the
+preserved side it decides whether a row *matches*, not whether it is read, and pruning
+by it would drop rows the query must return. Both halves are tested.
+
+### Two silent wrong answers, found on the way
+
+Neither was a performance bug, and neither was found by looking for it.
+
+**§1.12 — the anti-join bug, through `RIGHT JOIN`.** `null_padded_aliases` read the FROM
+clause as `args["from"]`, which sqlglot 30 spells `from_` — the trap §2.3 had already
+recorded. `args.get` returns `None` for a wrong key, which reads as *no FROM clause*, so
+the left side of a `RIGHT`/`FULL` join was never marked null-padded and
+`WHERE a.id IS NULL` pruned it to zero files. Every row came back instead of the
+unmatched ones. §1.10's fix had been verified on `LEFT JOIN` only.
+
+**§1.13 — `count()` over an exploded frame returned the table's row count.** Present
+since Phase 6 and reachable through `df.select(F.explode(...)).count()`. Phase 6 puts
+`unnest` in the select list, where three sqlglot rules treat it as the scalar expression
+it resembles: `pushdown_projections` replaced it with `1 AS _` when nothing referenced
+it, `pushdown_predicates` inlined it into a `WHERE` DuckDB then rejected, and
+`merge_subqueries` merged its scope away. `count()` said 5 where `collect()` said 15.
+
+`plan/cardinality.py` now names the row-multiplying nodes, and those three rules are
+skipped when a plan contains one. The cost is subquery flattening on exploded queries;
+scan pruning survives, because `plan/pushdown.py` reads the qualified tree itself.
+
+**What both have in common** is that each was one question away from being caught for
+two phases. Phase 6 tested `collect()`; Phase 4 tested `LEFT JOIN`. Neither asked
+whether the other spelling of the same thing agreed.
+
+### Streaming, and a guard that had to be built
+
+`toArrowBatches()` yields the result as DuckDB produces it; `toLocalIterator()` turns
+those into `Row`s a batch at a time. Both compile through the same path as `collect()` —
+pruning and conformance are not things a streaming caller opts out of.
+
+The stream runs on the session's **shared** cursor, which it has to: a registered Arrow
+table and a `CREATE TEMP TABLE` are both per-cursor in DuckDB, so a dedicated connection
+would not see a cached frame, a `createDataFrame`, or a metadata table. Sharing costs
+this: DuckDB ends a result when its cursor runs the next query, and it does so
+**silently** — a half-read stream reports its prefix as the whole answer. Since
+iterating lazily is the entire point, running another query mid-iteration is a thing
+callers will do, so it is guarded rather than documented. Every `execute` bumps a
+per-thread counter; each batch checks it *before* pulling, because an invalidated reader
+does not error and does not yield — it simply says it is finished, so a check after the
+pull is never reached in the case it exists for.
+
+### Refused rather than half-done
+
+**Threads are still DuckDB's to choose.** PLAN.md Phase 10 proposed
+`threads = physical cores`. Measured across the benchmark suite, 2, 4 and 8 are
+indistinguishable — every difference inside the run-to-run spread — and 16, twice this
+machine's logical cores, is clearly worse (the join more than doubles). Physical (4) and
+DuckDB's default (8) are the same to within noise, so the change would add code and a
+configuration surface to buy nothing. Recorded as decision 17.
+
+**`memory_limit` is still DuckDB's to choose.** Sizing it from *available* rather than
+total RAM was the other Phase 10 bullet. It needs a dependency the project does not have
+(`psutil`), it is a snapshot that goes stale the moment it is taken, and the part that
+actually prevents an OOM — the spill directory — is already configured and now measured:
+the same query at the same limit fails without it and succeeds with it (§4.8). There is
+a floor, around 400 MB for that workload, below which DuckDB cannot spill at all.
+
+Both are decisions, not omissions, and both are decisions the benchmark harness exists
+to allow. Neither has a guard, because neither can be wrong in a way that changes an
+answer.
+
+### A cache keyed on identity, not on time
+
+PLAN.md asked for a query cache and "catalog/schema caching with TTL". Profiling the
+compile path put ~17 ms of an 84 ms query in schema analysis — a DuckDB round trip, paid
+again by every frame derived from the same shape, because `DataFrame.schema` is memoised
+per frame and a derived frame is a new one. Caching it takes that to **0.4 ms**.
+
+**No TTL.** A TTL is an approximation of "has this changed": stale for its window,
+wasteful for the rest. Iceberg hands us the exact answer for free, so the key is the
+bound SQL plus each source's `schema_id` and snapshot, plus an epoch covering the
+relations a session materialises. An evolved table is a different key, not an expired
+one — and the tests that matter are the misses, because a stale schema is a wrong column
+list.
+
+The rest of the query cache is **not built**. Compiling is ~9 ms and the manifest work
+it wraps is 20–40 ms and cannot be cached without invalidation the catalog does not
+offer cheaply; caching results is worse, because a cached result is a stale one the
+moment anyone writes. There is a real gain available here and it needs its own design.
+
+### The benchmark harness
+
+`scripts/benchmark.py` builds a partitioned 200-column table and times nine queries,
+each checking its own answer on every repeat — a benchmark that got fast by getting
+wrong is what a timing harness hides best. Results are committed to
+[BENCHMARKS.md](BENCHMARKS.md), which also carries a table for reading a regression:
+each case differs from its neighbour in exactly one thing, so a slowdown lands on one
+row and that row names the cause.
+
+The most useful number it produced was not a Phase 10 target at all. `collect()` on the
+200-column table is **25.4 s**; `toArrow()` on the same query is **1.3 s**. The scan is a
+second and a half and the rest is building 40 million Python values. That makes the
+streaming API a speed feature as much as a memory one, and it means the honest figure
+for projection pushdown is 13x, not the 31x a `collect()`-to-`collect()` comparison
+suggests (FINDINGS §3.8).
+
+### Phase 10's checklist, closed
+
+| PLAN.md asked for | Outcome |
+|---|---|
+| `memory_limit` + spill sized from available RAM | Spill measured and kept; sizing **declined**, with the measurement to say why |
+| threads = physical cores, no user config | **Declined** — measured indistinguishable from the default (decision 17) |
+| Wide-table benchmark harness | `scripts/benchmark.py`, nine cases, answers checked |
+| Result streaming so a large result never OOMs | `toArrowBatches()` / `toLocalIterator()`, with a staleness guard |
+| Query cache; catalog/schema caching with TTL | Schema cache done, keyed on identity rather than a TTL; the query cache is **not built**, and why is above |
+| Benchmarks committed as a tracked file | [BENCHMARKS.md](BENCHMARKS.md) |
+
+---
+
+## Phase 11 — Extras · **DONE** (2026-09-02)
+
+UDFs, table maintenance, file readers, and the documentation the project had been
+deferring. Two of the four turned up dependency behaviour that changed the design
+rather than merely being wired up.
+
+### Python UDFs, and the null handling that took measuring
+
+`session.udf.register(name, f, returnType)` returns a callable usable on both surfaces;
+`F.udf` and `F.pandas_udf` are the decorator forms against the active session. The
+return type is **declared**, not inferred — DuckDB needs it before the first row — and
+complex types work, because the translation runs through sqlglot rather than a
+hand-written table.
+
+Two wiring details are easy to get wrong and both are tested:
+
+- **Registration goes on two connections.** The engine executes on one DuckDB
+  connection and the analyzer binds schemas on another; a UDF registered only on the
+  first fails at *analysis*, with an error naming a catalog rather than a function.
+- **Re-registering replaces.** The reference allows it, DuckDB raises, so the old one
+  is removed first — and the schema cache is invalidated, because the same SQL with a
+  new return type is the one case a SQL-keyed cache gets wrong.
+
+**The null handling is the part worth reading** (FINDINGS §2.9). DuckDB's two modes are
+each unusable alone: `DEFAULT` forbids a UDF from *returning* NULL, and `SPECIAL` hands
+a UDF over `read_parquet` an extra row of NULLs the data never contained — so
+`udf(lambda x: x * 2)` would crash on every Iceberg scan. Registering as `SPECIAL` and
+wrapping the function to absorb an all-NULL call resolves both. `callOnNull=True`
+removes the wrapper for the case that wants the reference's behaviour.
+
+### Maintenance, three parts built and one part refused
+
+PyIceberg 0.11 provides `expire_snapshots` and nothing else (FINDINGS §4.9), so
+`io/maintenance.py` builds the rest:
+
+| | |
+|---|---|
+| `compact()` | per partition: read, sort by the table's sort order, `overwrite` with a filter naming that partition — one commit that replaces its files |
+| `expireSnapshots()` | wraps PyIceberg's builder, adding `retainLast`, which it has no notion of |
+| `removeOrphanFiles()` | walks the location, subtracts every file any snapshot references, **reports by default** |
+| `rewriteManifests()` | **refused** — a hand-written manifest fails silently by hiding data files |
+
+Compaction skips partitions that are already fine, so running it repeatedly costs
+nothing, and the tests assert on **rows** rather than file counts: a compaction that
+halved the file count and lost a row would satisfy any count-based test, and it is the
+worst thing this module could do.
+
+`removeOrphanFiles` reports rather than deletes, and ignores anything written in the
+last three days. A commit in flight writes its data files before referencing them, so
+"recent and unreferenced" is a description of live data as often as of rubbish.
+
+### File readers, and one refusal
+
+`session.read.parquet/csv/json` build `SELECT * FROM read_parquet('...')` — a table
+*function*, which every part of the planner already skips when looking for tables to
+resolve, so it needed no special case in the catalog, the scan planner or pushdown. It
+gets no pruning, correctly: there are no manifests to prune with.
+
+**Object-store paths are refused.** The schema is bound on the analyzer's connection,
+which carries neither httpfs nor the S3 credentials the engine's connection is given,
+so a working execution would sit behind a failing analysis. Refused plainly, naming
+`session.table()` for data that lives in the warehouse.
+
+### Documentation, and what writing it found
+
+[`GUIDE.md`](GUIDE.md) and [`notebooks/00_quickstart.ipynb`](notebooks/00_quickstart.ipynb).
+The notebook builds its own warehouse and needs no catalog, and **every cell was run**
+rather than written and hoped for — which is how FINDINGS §2.10 turned up.
+
+Appending a CSV to an existing table failed with `UnicodeEncodeError: 'charmap' codec
+can't encode '\u2705'`. The real cause was an ordinary schema mismatch — DuckDB's CSV
+sniffer reads `2026-08-17` as a `date` where the table stores a `string` — but
+PyIceberg reports a mismatch by *printing* a `rich` table of tick marks before raising,
+and on a Windows cp1252 console the print dies first. Half a diagnostic table, then an
+error about a codec, and the actual mismatch never reported.
+
+That silently undid Phase 7's §2.8, whose whole point was keeping PyIceberg's message
+"because that is the useful part". On Windows there was no message.
+`commit_with_retry` now translates it into an `AnalysisException` that says the schema
+does not match and names `PYTHONIOENCODING=utf-8` as the way to see the original.
+
+The notebook teaches the cast rather than hiding the problem, because a CSV whose types
+do not quite match the table is the normal case, not an edge one.
+
+### Phase 11's checklist, closed
+
+| PLAN.md asked for | Outcome |
+|---|---|
+| Python UDFs + `pandas_udf` via DuckDB registration | Done, on both surfaces, with the null handling of FINDINGS §2.9 |
+| `io/maintenance.py`: compaction, `expire_snapshots`, `rewrite_manifests`, orphan cleanup | Three done; `rewriteManifests` **refused**, with its reason |
+| Non-Iceberg sources as convenience readers | `parquet`, `csv`, `json`; object-store paths refused |
+| `notebooks/00_quickstart.ipynb` and the user guide | Both, and the notebook is run rather than assumed |
+
+---
+
+## Decision 17 — DuckDB sizes its own threads and memory (2026-09-02)
+
+PLAN.md Phase 10 proposed setting `threads` to the physical core count and
+`memory_limit` from available RAM. **Neither is done, and both are measured rather than
+argued.**
+
+`--compare-threads 2 4 8 16` over the benchmark suite: 2, 4 and 8 are indistinguishable,
+and 16 — twice this machine's logical cores — is worse across every case, more than
+doubling the join. Physical cores (4) and DuckDB's default (8) differ by less than the
+run-to-run spread, so pinning threads would add a configuration surface, a dependency to
+count physical cores portably, and no measurable gain.
+
+For memory: DuckDB already sizes `memory_limit` at ~80% of total RAM, and the thing that
+actually turns an out-of-memory error into a completed query is the **spill directory**,
+which icetl has always configured and which §4.8 now measures — the same query fails
+without it and succeeds with it.
+
+**What this costs:** on a machine where another process holds most of the RAM, DuckDB's
+80%-of-total is an over-commitment, and icetl will not notice. The failure mode is an
+`Out of Memory` from DuckDB rather than a wrong answer, and the fix is one line —
+`.config("icetl.duckdb.memoryLimit", "4GB")` — which is why this is documented rather
+than guarded. Revisit it with a measurement, not with a reason; `scripts/benchmark.py`
+is there to take one.
+
+---
+
 ## Decision 16 — SQL-surface function resolution deferred to Phase 15 (2026-08-30)
 
 **P1 holds for the plan, not yet for the function library.** Relational structure and the
@@ -1382,9 +1690,15 @@ with the rule each one taught.
 | 11 | Two references to one table merge to a single scan (union of columns, OR of predicates). Correct, but a self-join with disjoint filters prunes less than it could. | Phase 4 |
 | 13 | Functions built by *composition* in `sql/functions.py` are reachable only through `F.*`; `Session.sql()` hands the bare name to DuckDB. `weekday`/`dayofweek` answer **silently differently**; 8 more raise. Deferred by decision 16. | **Phase 15** |
 | 14 | `size(NULL)` gives `NULL` on both surfaces; the reference says `-1`. `array_size`'s own docstring says the two must differ, but `size` is `sg.ArraySize`, which makes them aliases. | **Phase 15** |
-| 15 | `explain()`'s `bytes_scanned` is the *selected files'* size, not bytes read — it ignores column pruning, so a narrow query looks far more expensive than it is. | Phase 10 |
-| 16 | An unfiltered `count(*)` reads parquet footers when Iceberg's manifests already hold the row count (~2× on a 357-file table, and it grows with file count). | Phase 10 |
+| ~~15~~ | ~~`explain()`'s `bytes_scanned` ignores column pruning~~ — **closed in Phase 10**: it is now a sum over the selected columns, from the manifests' per-column sizes, printed beside the file total. | — |
+| ~~16~~ | ~~An unfiltered `count(*)` reads parquet footers~~ — **closed in Phase 10**: `plan/counting.py` answers it from the manifest sum on both surfaces, opening no file at all. A filter disqualifies it, because file pruning is an over-approximation. | — |
 | 17 | A generated plan may not carry meaning in a **constant** column: `merge_subqueries` flattens the subquery and the constant folds, so `TRUE AS __matched` past a LEFT JOIN stops meaning “the join matched”. Express it as a predicate (`EXISTS`, or an inner join) instead. | any phase generating SQL |
+| 18 | A **generator** in a select list is not a scalar expression, and three sqlglot rules treat it as one. `plan/cardinality.py` lists the row-multiplying nodes and `optimize_plan` skips those rules when one is present — **anything added to `sql/generators.py` must be added to that list**, or the optimizer will quietly drop it (FINDINGS §1.13). | any phase touching generators |
+| 19 | `args["from"]` is `args["from_"]` in sqlglot 30 and `args.get` returns `None` rather than raising, which reads as “no FROM clause”. It cost a wrong answer twice; `pushdown._from_table` reads both spellings in one place (FINDINGS §2.3, §1.12). | any phase reading a plan tree |
+| 20 | A fix verified on one spelling of a construct is not verified. §1.10 was fixed for `LEFT JOIN` and stayed broken for `RIGHT`/`FULL` for five phases. Test every spelling, and assert the spellings agree with each other. | any phase |
+| 21 | A **UDF** is registered on two DuckDB connections — the engine's and the analyzer's — because a function missing from the analyzer's fails at *analysis*, with an error naming a catalog rather than a function. Anything else that teaches DuckDB a new name has the same requirement. | any phase adding DuckDB functions |
+| 22 | `duckdb.typing` and `duckdb.functional` do **not** exist in duckdb 1.5 — types are `duckdb.dtype("<text>")` or `duckdb.sqltypes`, and the UDF enums live in a private `_duckdb._func`. Every tutorial says otherwise (FINDINGS §4.10). | any phase touching DuckDB's Python API |
+| 23 | **Run the documentation.** Executing every quickstart cell is what found §2.10, a schema mismatch reporting a codec error instead of itself on every Windows console. Prose that has not been run is untested code. | any phase writing docs |
 
 ---
 

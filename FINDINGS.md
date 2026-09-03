@@ -252,6 +252,59 @@ only when a column had been **renamed**, and an added column has one name and no
 earlier schema is one some file can predate — and enters the same path. O(schemas), like
 the rename check beside it, so a table whose schema never changed still opens no footers.
 
+### 1.12 🔴 The anti-join bug again, through a join spelled the other way round
+
+*Phase 10, found while building the metadata count.* §1.10's fix holds back a `WHERE`
+conjunct over a table an outer join can null-pad. It read the FROM clause as
+`args["from"]` — which sqlglot 30 spells `from_`, exactly as §2.3 records — and
+`args.get` does not raise for a wrong key. It returns `None`, which reads as *this query
+has no FROM clause*.
+
+Nothing broke for a `LEFT JOIN`: the padded side there is the join's own right, which
+needs no FROM. But a `RIGHT` or `FULL` join null-pads the side that **is** the FROM
+clause, and that side was therefore never held back:
+
+```sql
+SELECT b.id FROM fx.plain AS a RIGHT JOIN fx.partitioned AS b
+  ON a.id = b.id WHERE a.id IS NULL
+```
+
+`a.id IS NULL` pruned `a` to **zero files**, so the anti-join matched nothing and all 12
+rows came back instead of the 7 unmatched ones. Silent, and a wrong answer rather than a
+slow one.
+
+**Guard:** `_from_table` reads both spellings in one named place. The lesson is not about
+sqlglot — it is that a fix verified on one spelling of a construct was never verified on
+the others, so the fixture tests now assert the `RIGHT` and `FULL` forms give the same
+answer as the `LEFT` one.
+
+### 1.13 🔴 The optimizer dropped a generator, so `count()` counted the wrong table
+
+*Phase 10, present since Phase 6.* Phase 6 puts `unnest` in the **select list** rather
+than the FROM clause, because DuckDB expands it there for free and correlates repeated
+copies. The cost is a set-returning function sitting exactly where every optimizer rule
+expects a scalar — and three of sqlglot's rules moved it as if it were one:
+
+| rule | what it did |
+|---|---|
+| `pushdown_projections` | replaced the unreferenced generator with `1 AS _` |
+| `pushdown_predicates` | inlined the generator into a `WHERE` |
+| `merge_subqueries` | merged its defining scope away entirely |
+
+`df.select(F.explode(...)).count()` therefore returned the **table's** row count, not the
+query's — 5 instead of 15 — because `count(*)` references no column, so the generator was
+unreferenced, so it was dropped. `collect()` on the same frame returned all 15 rows, so
+the two disagreed. Filtering on a generated column was the loud half of the same cause:
+*Binder Error: UNNEST not supported here*.
+
+**Guard:** `plan/cardinality.py` names the row-multiplying nodes and `optimize_plan`
+skips those three rules when a plan contains one. What it costs is subquery flattening on
+exploded queries; scan pruning survives, because `plan/pushdown.py` reads the qualified
+tree itself rather than relying on those rules.
+
+**Why it lasted two phases:** every Phase 6 test asserted on `collect()`, which was
+right. Nothing asked the same frame two different questions and compared the answers.
+
 ---
 
 ## 2. Loud failures — bugs that could not mislead
@@ -349,6 +402,58 @@ straight out through the write path. A caller catching `AnalysisException`, whic
 **Guard:** `commit_with_retry` translates it, keeping PyIceberg's own message -- which is
 the useful part, and is what the Phase 7 test already matched on.
 
+### 2.9 🟠 Neither of DuckDB's UDF null-handling modes is usable on its own
+
+*Phase 11.* Registering a Python UDF means choosing `null_handling`, and DuckDB offers
+two. Measured over `read_parquet`, which is every Iceberg scan:
+
+| | a UDF that returns NULL | `udf(lambda x: x * 2)` over a scan |
+|---|---|---|
+| `DEFAULT` | **raises** — *"the UDF is not expected to return NULL values"* | fine |
+| `SPECIAL` | fine | **raises** — one extra call with NULL arguments |
+
+The second is the surprising one. Under `SPECIAL`, a UDF over `read_parquet` is handed
+**one extra row of NULLs the data never contained** — reproducible with plain DuckDB, a
+five-row parquet file with no nulls, and a vector that arrives with six elements. Over
+a materialised table it does not happen; over `read_parquet` it always does.
+
+So `DEFAULT` forbids returning NULL, which no general UDF can accept, and `SPECIAL`
+crashes the most ordinary UDF anyone writes.
+
+**Guard:** register as `SPECIAL` — returning NULL is not negotiable — and wrap the
+function so a call whose arguments are *all* None returns None without reaching it.
+That absorbs DuckDB's invented row and gives NULL in, NULL out. `callOnNull=True`
+removes the wrapper for a UDF whose job is turning NULL into something; such a function
+handles `None` by construction, which is what makes the invented row harmless for it.
+
+**What this costs:** for a single-argument UDF, NULL in gives NULL out rather than the
+reference's "call the function with `None`". Recorded in `divergence.md`, opt-out-able,
+and the alternative was a spurious crash on every scan.
+
+### 2.10 🟠 A schema mismatch reports a codec error instead, on Windows
+
+*Phase 11, found while running the quickstart notebook.* PyIceberg renders a schema
+mismatch as a `rich` table of ✅ and ❌ marks, **printed to stdout before it raises**.
+On a Windows console using cp1252 that print raises `UnicodeEncodeError` first, so:
+
+```
++----------------------------------------------------+
+|    | Table field           | Dataframe field       |
+|----+-----------------------+-----------------------|
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705'
+```
+
+Half a diagnostic table, then an error about a codec. The actual mismatch — which
+column, which type — is never reported. Reproducible with PyIceberg alone, no icetl
+involved, and it silently undid §2.8's guarantee that PyIceberg's own message is kept
+because that message is the useful part. On Windows there was no message.
+
+**Guard:** `commit_with_retry` translates `UnicodeEncodeError` into an
+`AnalysisException` saying the data does not match the table's schema, and naming
+`PYTHONIOENCODING=utf-8` as the way to see PyIceberg's own report. The real message
+cannot be recovered — PyIceberg was still assembling it — so saying what happened is
+what is available, and it beats a charmap complaint by a distance.
+
 ---
 
 ## 3. Performance findings
@@ -365,17 +470,31 @@ was scanning **19 of 19** columns — and 219 of 219 on the wide table. Now 3 of
 *Phase 4, carry-over note 10, now closed.* `_naming_branch` re-aliases the leftmost
 branch, so a set operation over an unaliased aggregate prunes like any other query.
 
-### 3.3 🟡 `explain()`'s `bytes_scanned` ignores column pruning — **open**
+### 3.3 🟡 `explain()`'s `bytes_scanned` ignored column pruning — **closed, Phase 10**
 
-It reports the *selected files'* size, not bytes read, so a narrow query looks far more
-expensive than it is. Carry-over note 15, Phase 10.
+It reported the *selected files'* size, not bytes read, so a query reading 2 of 200
+columns looked exactly as expensive as one reading all 200 — the number existed to show
+whether pushdown worked and could not show it.
 
-### 3.4 🟡 An unfiltered `count(*)` opens parquet footers — **open**
+**Fixed:** Iceberg's manifests carry a compressed size per column, so `bytes_scanned` is
+now a sum over the selected columns (nested leaves included), and `bytes_total` reports
+the files' size beside it. Both, because either alone is unreadable: one says how much
+work the query does, the other how much of the table pruning failed to remove. The fixed
+`MB` rendering went with it — it printed a 16x difference as "0.0 MB of 0.1 MB".
 
-Iceberg's manifests already hold the row count. Roughly 2× on a 357-file table, and it
-grows with file count. Carry-over note 16, Phase 10.
+### 3.4 🟡 An unfiltered `count(*)` opened parquet footers — **closed, Phase 10**
 
-### 3.5 🟡 An inner join's `WHERE` conjunct stops pruning — **open**
+Iceberg's manifests already hold the row count. **Fixed:** `plan/counting.py` recognises
+`SELECT count(*)` over a bare scan on both surfaces and answers from the manifest sum —
+0.042 s against a 1.3 s full scan on the benchmark table, and it opens no file at all,
+which `TestNoFileIsOpened` proves by deleting the parquet files first and asking again.
+
+The recognition is a whitelist of plan shapes, not a search for disqualifiers. **A filter
+disqualifies it**: file pruning is an over-approximation, so summing the selected files'
+record counts under a predicate would return a number that is too big and look
+authoritative doing it. So would a generator, which is §1.13.
+
+### 3.5 🟡 An inner join's `WHERE` conjunct stopped pruning — **closed, Phase 10**
 
 *Phase 9, measured.* `pushdown_predicates` folds a `WHERE` conjunct over an
 **inner**-joined table into the join's `ON` clause, and `extract_scan_requests` reads only
@@ -387,9 +506,13 @@ INNER JOIN ... WHERE b.as_at_date = '2026-08-16'   ->  3 of 3 files
 LEFT  JOIN ... WHERE b.as_at_date = '2026-08-16'   ->  1 of 3 files
 ```
 
-Reading the `ON` clause as well is Phase 10 work. Pinned in
-`TestOuterJoinsAreNotPrunedByTheirOwnNullChecks` so the difference is not later mistaken
-for the outer-join fix on the same page.
+**Fixed:** `join_predicates` reads the `ON` clause too, for the side the join *filters* —
+both sides of an inner join, the right of a `LEFT`, the left of a `RIGHT`, neither of a
+`FULL`. On the filtered side the conjunct applies to rows read from the table before any
+null-padding, so unlike a `WHERE` conjunct it needs no `is_null_rejecting` gate. Both
+spellings now prune to one file. The pin that recorded the gap became the test for the
+fix, and its unsafe mirror image — a preserved side must still not prune — sits beside
+it.
 
 ### 3.6 🟡 Two references to one table merge to a single scan — **open**
 
@@ -402,6 +525,29 @@ DuckDB's aggregation order over parallel scans. Expected for floats; Spark does 
 Documented rather than fixed.
 
 ---
+
+### 3.8 🟡 `collect()` on a wide result is 95% Python, not DuckDB
+
+*Phase 10, measured.* On the 200-column benchmark table at 200,000 rows:
+
+| | best |
+|---|---:|
+| `collect()` — 200 columns | **25.4 s** |
+| `toArrow()` — the same query | **1.3 s** |
+| `collect()` — 2 columns | 0.44 s |
+| `toArrow()` — the same 2 columns | 0.035 s |
+
+The scan takes a second and a half. The other twenty-four seconds are building 200,000
+`Row` objects of 200 fields each — 40 million Python values.
+
+Two things follow. **`toArrow()` / `toArrowBatches()` is a speed feature**, not only a
+memory one, and it is the first thing to reach for on a wide table. And **the honest
+figure for projection pushdown is 13x** (1.31 s against 0.035 s, Arrow to Arrow); the
+31x a `collect()`-to-`collect()` comparison suggests is mostly Row building on both
+sides. BENCHMARKS.md is where these numbers stay current.
+
+Not a bug — `Row` is what `collect()` promises. Worth writing down because the obvious
+measurement attributes the cost to the wrong component.
 
 ## 4. Measured and found fine
 
@@ -472,7 +618,58 @@ Iceberg models replacing rows — but **one commit**, so no reader sees the tabl
 mid-overwrite. `TestStreamingIsBlockedUpstream` and `TestSnapshotShape` assert both, so
 the failure is the signal that something became buildable.
 
+### 4.8 🟢 Spill works, and it has a floor
+
+*Phase 10.* The engine always configures DuckDB's `temp_directory`, on the grounds that
+DuckDB will not spill without one. Measured rather than assumed — a sort with roughly
+600 MB of working set inside a 400 MB `memory_limit`:
+
+| `temp_directory` | result |
+|---|---|
+| set | **OK**, 1.77 s |
+| empty (DuckDB's "do not spill") | `Out of Memory` |
+
+So the setting does exactly what it claims, and `tests/fixture/test_engine_memory.py`
+pins it as that *difference* rather than as a setting — a test asserting only that the
+option was applied would still pass on a DuckDB that had stopped honouring it.
+
+**The floor is the part worth knowing.** Below roughly 400 MB the same query fails
+either way: DuckDB needs a working set of buffers before it has anything to spill from.
+A temp directory buys a query too big for memory, not a query with no memory.
+`preserve_insertion_order` made no difference at any limit tried, despite DuckDB's own
+error message suggesting it.
+
 ---
+
+### 4.9 🟢 PyIceberg 0.11 has `expire_snapshots` and nothing else
+
+*Phase 11.* `Table.maintenance` exists and carries exactly one builder —
+`expire_snapshots`, with `by_id`, `by_ids` and `older_than`. There is no
+`rewrite_data_files`, no `rewrite_manifests`, and no orphan-file cleanup, so PLAN.md's
+maintenance bullet is three parts build and one part wrap.
+
+Compaction is therefore ours: read a partition, sort it by the table's sort order, and
+`overwrite` with a filter naming that partition — one commit that replaces its files.
+`retainLast` is ours too, because the builder expires by age or by id and has no notion
+of "keep the newest N", which is the form a retention policy is usually written in.
+
+`rewrite_manifests` is **refused** rather than built. Writing manifest lists by hand is
+possible — the test fixtures do it — but a manifest that is subtly wrong does not fail,
+it makes data files invisible to every reader, which is data loss wearing the costume
+of a successful commit.
+
+### 4.10 🟢 `duckdb.typing` and `duckdb.functional` are gone in 1.5
+
+*Phase 11.* Every DuckDB UDF tutorial opens with `from duckdb.typing import BIGINT` and
+`from duckdb.functional import PythonUDFType`. In duckdb 1.5.5 neither module exists:
+the types moved to `duckdb.sqltypes` and the enums to a private `_duckdb._func`.
+
+Neither is used directly. Types are built with `duckdb.dtype("<text>")`, fed from
+sqlglot's own spark→duckdb translation, so `array<string>` and `struct<a:bigint>` come
+for free and stay consistent with every other type conversion in the codebase. The
+enums are read from the private module with a fallback to the plain strings, which are
+accepted at runtime — preferring the enums so that a string that stopped being accepted
+would fail at registration rather than quietly.
 
 ## 5. Process hazards
 
@@ -526,10 +723,8 @@ since paid off:
 |---|---|---|
 | §1.8 | `weekday` / `dayofweek` differ between the surfaces, silently | **Phase 15** |
 | — | `size(NULL)` is `NULL` on both surfaces; the reference says `-1` | **Phase 15** |
-| §3.3 | `explain()`'s `bytes_scanned` ignores column pruning | Phase 10 |
-| §3.4 | An unfiltered `count(*)` reads parquet footers | Phase 10 |
-| §3.5 | An inner join's `WHERE` conjunct is folded into `ON` and stops pruning | Phase 10 |
 | §3.6 | A self-join with disjoint filters prunes less than it could | Phase 4 note 11 |
 | §3.7 | `sum(double)` varies in its last digits | documented, not fixed |
+| §3.8 | `collect()` on a wide result is dominated by `Row` building | documented; `toArrow()` is the answer |
 | — | Rename reconciliation is local-fixture-only and opens one footer per file; wants a benchmark before it meets a 4096-file table | Phase 2 leftover |
 | — | The `MERGE` cardinality check fires for a by-source-only merge; whether the reference does too is unmeasured | Phase 8 |

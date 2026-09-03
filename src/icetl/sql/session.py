@@ -48,6 +48,7 @@ from icetl.plan.builder import (
     split_version,
     substitute_sources,
 )
+from icetl.plan.counting import countable_scan
 from icetl.plan.optimizer import OptimizedPlan, optimize_plan
 from icetl.plan.pushdown import extract_scan_requests
 from icetl.plan.schema import SchemaBinder
@@ -55,14 +56,16 @@ from icetl.sql.catalog import Catalog as SessionCatalog
 from icetl.sql.conformance import apply_compat_semantics
 from icetl.sql.dataframe import DataFrame
 from icetl.sql.reader import DataFrameReader
+from icetl.sql.udf import UDFRegistration
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     import pyarrow as pa
     from pyiceberg.catalog import Catalog
 
     from icetl.catalog.resolver import TableRef
+    from icetl.io.maintenance import TableMaintenance
     from icetl.types import StructType
 
 __all__ = ["CompiledPlan", "Session"]
@@ -154,6 +157,7 @@ class Session:
         self._counter = 0
         self._cached: set[str] = set()
         self._catalog_facade: SessionCatalog | None = None
+        self._udf: UDFRegistration | None = None
         self._temp_views: dict[str, exp.Expression] = {}
         self._lock = threading.Lock()
         self._stopped = False
@@ -282,8 +286,36 @@ class Session:
         return DataFrameReader(self)
 
     @property
-    def udf(self) -> Any:
-        raise UnsupportedFeatureError("Session.udf", phase="Phase 11")
+    def udf(self) -> UDFRegistration:
+        """Register Python functions for use in this session, on both surfaces.
+
+            slen = session.udf.register("slen", len, "int")
+            df.select(slen("name"))
+            session.sql("SELECT slen(name) FROM t")
+
+        The registration lives as long as the session. See `sql/udf.py` for why it
+        goes on two DuckDB connections and why the function is called with NULL.
+        """
+        if self._udf is None:
+            self._udf = UDFRegistration(self)
+        return self._udf
+
+    def maintenance(self, tableName: str) -> TableMaintenance:
+        """Compaction, snapshot expiry and orphan cleanup for one table.
+
+            session.maintenance("nyc.trips").compact()
+
+        Not a property, because it addresses a table rather than the session. See
+        `io/maintenance.py` -- compaction is what keeps the read design of PLAN.md 3.6
+        working, not a tidiness feature.
+        """
+        from icetl.io.maintenance import TableMaintenance
+
+        if not isinstance(tableName, str):
+            raise EngineTypeError(
+                f"maintenance() expects a table name, got {type(tableName).__name__}."
+            )
+        return TableMaintenance(self, tableName)
 
     def createDataFrame(self, data: Any, schema: Any = None) -> DataFrame:
         """Build a frame from local data: rows, dicts, Rows, pandas or Arrow.
@@ -830,10 +862,69 @@ class Session:
         """Compile and run a plan, returning Arrow."""
         if self._stopped:
             raise UnsupportedFeatureError("Using a Session after stop()")
+        counted = self._count_from_metadata(plan, sources, output_names)
+        if counted is not None:
+            return counted
         compiled = self._compile(plan, sources, output_names)
         paths = [path for scan in compiled.scans for group in scan.groups for path in group.paths]
         self._engine.ensure_object_store(paths)
         return self._engine.arrow(compiled.sql, compiled.parameters or None)
+
+    def _count_from_metadata(
+        self,
+        plan: exp.Expression,
+        sources: Mapping[str, ScanSource],
+        output_names: Sequence[str],
+    ) -> pa.Table | None:
+        """Answer an unfiltered `count(*)` from Iceberg's manifests, or return None.
+
+        One rule serving both surfaces (P1): `df.count()` builds `SELECT count(*) FROM
+        (...)` and `session.sql("SELECT count(*) FROM t")` parses to the same shape, so
+        neither has to know this exists. Everything unrecognised returns None and runs
+        as before -- DuckDB gets the identical answer, having opened a parquet footer
+        per file to do it (FINDINGS.md 3.4).
+
+        The result is built as Arrow directly rather than executed, which is the point:
+        no file is touched at all.
+        """
+        import pyarrow as pa
+
+        source = countable_scan(plan, sources)
+        if source is None or len(output_names) != 1:
+            return None
+        rows = plan_scan(source).metadata_row_count
+        if rows is None:  # pragma: no cover - `countable_scan` admits no filter
+            return None
+        # BIGINT, because that is what DuckDB's own count(*) is bound to -- the
+        # analyzer has already told the caller to expect it.
+        return pa.table({output_names[0]: pa.array([rows], type=pa.int64())})
+
+    def _stream(
+        self,
+        plan: exp.Expression,
+        sources: Mapping[str, ScanSource],
+        output_names: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> Iterator[pa.RecordBatch]:
+        """Compile and run a plan, yielding Arrow batches instead of one table.
+
+        The same compile path as `_execute` -- pruning, pushdown and conformance are
+        not things a streaming caller opts out of. Only the last step differs.
+        """
+        if self._stopped:
+            raise UnsupportedFeatureError("Using a Session after stop()")
+        counted = self._count_from_metadata(plan, sources, output_names)
+        if counted is not None:
+            # One row, already in hand. Yielding it keeps the caller's loop uniform.
+            yield from counted.to_batches()
+            return
+        compiled = self._compile(plan, sources, output_names)
+        paths = [path for scan in compiled.scans for group in scan.groups for path in group.paths]
+        self._engine.ensure_object_store(paths)
+        yield from self._engine.record_batches(
+            compiled.sql, compiled.parameters or None, batch_size=batch_size
+        )
 
     # -- lifecycle ---------------------------------------------------------
 

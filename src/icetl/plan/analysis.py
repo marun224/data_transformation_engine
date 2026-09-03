@@ -55,6 +55,10 @@ if TYPE_CHECKING:
 
 __all__ = ["PlanAnalyzer", "arrow_to_datatype", "arrow_to_struct_type"]
 
+#: How many analysed schemas a session holds before dropping them all. Sized so an
+#: ordinary script never reaches it and a pathological one cannot grow forever.
+_SCHEMA_CACHE_LIMIT = 512
+
 
 # Arrow types with no parameters, matched by identity against the singletons.
 _SCALAR_TYPES: list[tuple[pa.DataType, DataType]] = [
@@ -143,6 +147,11 @@ class PlanAnalyzer:
         self._connection: duckdb.DuckDBPyConnection | None = None
         self._registered: set[str] = set()
         self._lock = threading.Lock()
+        self._schemas: dict[tuple[str, tuple[Any, ...]], StructType] = {}
+        # Bumped whenever an arbitrary relation is registered or dropped. Included in
+        # every cache key, so a name reused for a different relation cannot return
+        # the previous relation's schema.
+        self._epoch = 0
 
     @property
     def connection(self) -> duckdb.DuckDBPyConnection:
@@ -168,27 +177,84 @@ class PlanAnalyzer:
         """
         self.connection.register(name, value)
         self._registered.add(name)
+        self._epoch += 1
+
+    def invalidate(self) -> None:
+        """Drop every cached schema, because something outside the SQL changed.
+
+        A registered UDF is the case this exists for. Its name appears in the SQL, so
+        a *new* UDF is already a new cache key -- but re-registering one name with a
+        different return type produces the identical SQL and a different schema, and
+        a cache keyed on SQL would answer from the previous registration.
+        """
+        self._epoch += 1
+        self._schemas.clear()
 
     def unregister_view(self, name: str) -> None:
         if name in self._registered:
             self.connection.unregister(name)
             self._registered.discard(name)
+            self._epoch += 1
+
+    def _cache_key(
+        self, sql: str, sources: Mapping[str, ScanSource]
+    ) -> tuple[str, tuple[Any, ...]]:
+        """What makes two analyses the same question.
+
+        The schema of a bound SQL string is a pure function of the schemas it is
+        bound against, so the key is the SQL plus the identity of every schema in
+        play: each source's `schema_id`, which Iceberg bumps on every evolution, and
+        the registry epoch, which covers the relations a session materialises.
+
+        Exact rather than time-based. PLAN.md proposed a TTL, but a TTL is only ever
+        an approximation of "has this changed" -- it goes stale for its whole window
+        and re-does work for the rest -- and Iceberg hands us the exact answer for
+        free. An evolved table is a different key, not an expired one.
+        """
+        fingerprint = tuple(
+            sorted(
+                (source.view, source.resolved.table.schema().schema_id, source.snapshot_id)
+                for source in sources.values()
+            )
+        )
+        return sql, (self._epoch, *fingerprint)
 
     def analyze(self, sql: str, sources: Mapping[str, ScanSource]) -> StructType:
         """Return the output schema of `sql`, or raise `AnalysisException`.
 
         `sql` must already have its sources substituted for their analysis views.
+
+        Cached: analysis is a DuckDB round trip and it was about 17 ms of an 84 ms
+        query on the benchmark table -- paid again by every frame derived from the
+        same shape, because `schema` is memoised per frame and a derived frame is a
+        new one. See `_cache_key` for what makes a repeat a repeat.
         """
         for source in sources.values():
             self.register(source)
+
+        key = self._cache_key(sql, sources)
+        cached = self._schemas.get(key)
+        if cached is not None:
+            return cached
+
         # LIMIT 0 is belt and braces: the sources are already empty, but an aggregate
         # over nothing still produces a row, and we only ever want the schema.
         wrapped = f"SELECT * FROM ({sql}) AS icetl_analysis LIMIT 0"
         try:
             result = self.connection.execute(wrapped).to_arrow_table()
         except duckdb.Error as exc:
+            # Deliberately not cached. A failure is cheap to repeat and caching one
+            # would mean a fixed table still reported the old complaint.
             raise AnalysisException(_analysis_message(exc)) from exc
-        return arrow_to_struct_type(result.schema)
+
+        schema = arrow_to_struct_type(result.schema)
+        if len(self._schemas) >= _SCHEMA_CACHE_LIMIT:
+            # A long-lived session generating unique SQL must not grow without bound.
+            # Dropped wholesale rather than by recency: the cost of a miss is one
+            # round trip, so tracking recency would cost more than it saves.
+            self._schemas.clear()
+        self._schemas[key] = schema
+        return schema
 
     def close(self) -> None:
         with self._lock:
@@ -196,6 +262,7 @@ class PlanAnalyzer:
                 self._connection.close()
                 self._connection = None
             self._registered.clear()
+            self._schemas.clear()
 
 
 def _analysis_message(exc: duckdb.Error) -> str:

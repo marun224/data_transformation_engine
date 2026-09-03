@@ -348,15 +348,14 @@ class TestOuterJoinsAreNotPrunedByTheirOwnNullChecks:
         assert padded.pushed_filter is not None
         assert padded.files_scanned == 1
 
-    def test_an_inner_join_answers_correctly_but_prunes_nothing(self, session: Session) -> None:
-        """Measured, and a pruning gap rather than a wrong answer.
+    def test_an_inner_join_prunes_through_its_on_clause(self, session: Session) -> None:
+        """The conjunct is in `ON` by the time we see it, and prunes from there.
 
-        `pushdown_predicates` folds a WHERE conjunct into an **inner** join's ON clause,
-        and the extractor reads only the scope's WHERE -- so the filter is applied by
-        DuckDB and prunes no files. The same query as a LEFT JOIN keeps the conjunct in
-        WHERE and prunes to one file, which is the test above. Reading the ON clause too
-        is Phase 10 work; recorded so the difference is not mistaken for the fix on this
-        page. FINDINGS.md §3.7.
+        `pushdown_predicates` folds a WHERE conjunct over an inner-joined table into
+        that join's ON clause. Reading only the scope's WHERE meant the same predicate
+        pruned one file as a LEFT JOIN and three -- every file -- as an INNER JOIN.
+        `join_predicates` reads the ON clause too, so both spellings now prune alike.
+        FINDINGS.md 3.5.
         """
         frame = session.sql(
             "SELECT a.id FROM fx.plain AS a "
@@ -366,5 +365,125 @@ class TestOuterJoinsAreNotPrunedByTheirOwnNullChecks:
         assert sorted(row[0] for row in frame.collect()) == [4, 5]
         compiled = session._compile(frame._plan, frame._sources, frame.columns)
         inner = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
-        assert inner.pushed_filter is None
-        assert inner.files_scanned == 3
+        assert inner.pushed_filter == "as_at_date = '2026-08-16'"
+        assert inner.files_scanned == 1
+
+    def test_the_two_join_spellings_now_prune_identically(self, session: Session) -> None:
+        """The measurement 3.5 recorded, inverted: 3 of 3 against 1 of 3, now 1 and 1."""
+        counts = []
+        for side in ("INNER", "LEFT"):
+            frame = session.sql(
+                f"SELECT a.id FROM fx.plain AS a "
+                f"{side} JOIN fx.partitioned AS b ON a.id = b.id "
+                f"WHERE b.as_at_date = '2026-08-16'"
+            )
+            compiled = session._compile(frame._plan, frame._sources, frame.columns)
+            scan = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+            counts.append(scan.files_scanned)
+        assert counts == [1, 1]
+
+    def test_an_on_conjunct_prunes_the_null_padded_side(self, session: Session) -> None:
+        """No `is_null_rejecting` gate here, and none is needed.
+
+        A LEFT JOIN's ON clause is applied to rows read from the right table, before
+        the join manufactures any NULL row -- so a right-side conjunct there filters
+        real rows and prunes safely, which a WHERE conjunct over the same alias does
+        not.
+        """
+        frame = session.sql(
+            "SELECT a.id, b.id FROM fx.plain AS a "
+            "LEFT JOIN fx.partitioned AS b "
+            "ON a.id = b.id AND b.as_at_date = '2026-08-16'"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        padded = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert padded.files_scanned == 1
+        # Every left row survives; only the match is narrowed.
+        rows = frame.collect()
+        assert len(rows) == 5  # fx.plain holds ids 1-5
+        assert sorted(row[1] for row in rows if row[1] is not None) == [4, 5]
+
+    def test_the_preserved_side_is_not_pruned_by_its_own_on_conjunct(
+        self, session: Session
+    ) -> None:
+        """`LEFT JOIN ... ON a.id > 3` keeps every row of `a`, so `a` may not prune.
+
+        The unsafe half of the same fix: on the preserved side an ON conjunct decides
+        whether a row *matches*, not whether it is read, and pruning by it would drop
+        rows the query must return.
+        """
+        frame = session.sql(
+            "SELECT a.id, b.id FROM fx.partitioned AS a "
+            "LEFT JOIN fx.plain AS b ON a.id = b.id AND a.as_at_date = '2026-08-16'"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        preserved = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert preserved.pushed_filter is None
+        assert preserved.files_scanned == 3
+        assert len(frame.collect()) == 12
+
+    def test_a_full_join_prunes_neither_side_by_its_on_clause(self, session: Session) -> None:
+        """A FULL join preserves both sides, so its ON clause filters neither."""
+        frame = session.sql(
+            "SELECT a.id, b.id FROM fx.plain AS a "
+            "FULL JOIN fx.partitioned AS b "
+            "ON a.id = b.id AND b.as_at_date = '2026-08-16'"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        for scan in compiled.scans:
+            assert scan.pushed_filter is None
+        both = next(s for s in compiled.scans if s.source.key == "fx.partitioned")
+        assert both.files_scanned == 3
+        # All 12 partitioned rows appear, matched or null-padded.
+        assert len([row for row in frame.collect() if row[1] is not None]) == 12
+
+
+class TestTheAntiJoinBugReachedThroughARightJoin:
+    """The same wrong answer as 1.10, through a spelling the fix for it never saw.
+
+    `null_padded_aliases` read `args["from"]`, which sqlglot 30 spells `from_`, so it
+    always saw a query with no FROM clause. Nothing broke for a LEFT JOIN -- the
+    padded side is the join's own right, which needs no FROM -- but a RIGHT or FULL
+    join null-pads the side that *is* the FROM clause, and that side was therefore
+    never held back. `WHERE a.id IS NULL` pruned `a` to zero files, so the anti-join
+    matched nothing, and every row came back instead of the unmatched ones.
+
+    Found while building Phase 10; silent, and a wrong answer rather than a slow one.
+    FINDINGS.md 1.12.
+    """
+
+    ANTI_JOIN = (
+        "SELECT b.id FROM fx.plain AS a RIGHT JOIN fx.partitioned AS b "
+        "ON a.id = b.id WHERE a.id IS NULL"
+    )
+
+    def test_a_right_join_anti_join_answers_correctly(self, session: Session) -> None:
+        """`fx.plain` holds ids 1-5, so the unmatched ids are 0 and 6-11."""
+        rows = session.sql(self.ANTI_JOIN).collect()
+        assert sorted(row[0] for row in rows) == [0, 6, 7, 8, 9, 10, 11]
+
+    def test_the_from_side_of_a_right_join_is_not_pruned(self, session: Session) -> None:
+        frame = session.sql(self.ANTI_JOIN)
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        padded = next(s for s in compiled.scans if s.source.key == "fx.plain")
+        assert padded.pushed_filter is None
+        assert padded.files_scanned == 1
+
+    def test_a_full_join_pads_both_sides(self, session: Session) -> None:
+        frame = session.sql(
+            "SELECT a.id, b.id FROM fx.plain AS a FULL JOIN fx.partitioned AS b "
+            "ON a.id = b.id WHERE a.id IS NULL"
+        )
+        compiled = session._compile(frame._plan, frame._sources, frame.columns)
+        for scan in compiled.scans:
+            assert scan.pushed_filter is None
+        assert sorted(row[1] for row in frame.collect()) == [0, 6, 7, 8, 9, 10, 11]
+
+    def test_the_left_join_spelling_was_never_wrong(self, session: Session) -> None:
+        """Both directions of the same anti-join now agree, which is the real check."""
+        left = session.sql(
+            "SELECT a.id FROM fx.partitioned AS a LEFT JOIN fx.plain AS b "
+            "ON a.id = b.id WHERE b.id IS NULL"
+        ).collect()
+        right = session.sql(self.ANTI_JOIN).collect()
+        assert sorted(row[0] for row in left) == sorted(row[0] for row in right)

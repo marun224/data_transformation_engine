@@ -63,6 +63,7 @@ __all__ = [
     "extract_scan_requests",
     "is_exactly_translatable",
     "is_null_rejecting",
+    "join_predicates",
     "null_padded_aliases",
     "scope_predicate",
     "translate_predicate",
@@ -439,9 +440,9 @@ def null_padded_aliases(expression: exp.Expression) -> set[str]:
         return set()
     padded: set[str] = set()
     seen: list[str] = []
-    source = expression.args.get("from")
+    source = _from_table(expression)
     if source is not None:
-        seen.append(source.this.alias_or_name)
+        seen.append(source.alias_or_name)
     for join in expression.args.get("joins") or []:
         side = str(join.args.get("side") or "").upper()
         right = join.this.alias_or_name
@@ -451,6 +452,78 @@ def null_padded_aliases(expression: exp.Expression) -> set[str]:
             padded.update(seen)
         seen.append(right)
     return padded
+
+
+def _from_table(expression: exp.Select) -> exp.Expression | None:
+    """The `FROM` relation, under whichever key this sqlglot spells it.
+
+    sqlglot 30 renamed the argument to `from_` because `from` is a Python keyword
+    (FINDINGS.md 2.3), and `args.get("from")` does not raise when it is wrong -- it
+    returns None, which reads as "this query has no FROM clause". That silence cost a
+    correct answer once already: `null_padded_aliases` below never saw the left-hand
+    table, so the left of a `RIGHT`/`FULL JOIN` was never marked null-padded and the
+    anti-join of 1.10 came back with every row. Both spellings are read so a future
+    rename fails loudly by returning nothing at all rather than quietly here.
+    """
+    clause = expression.args.get("from_") or expression.args.get("from")
+    return clause.this if clause is not None else None
+
+
+def join_predicates(expression: exp.Expression) -> dict[str, list[exp.Expression]]:
+    """`ON` conjuncts that are true filters on a table's own rows, keyed by alias.
+
+    A `WHERE` clause is not the only place a filter ends up. sqlglot's
+    `pushdown_predicates` folds a `WHERE` conjunct over an inner-joined table *into
+    that join's `ON` clause*, so a query written with the filter in `WHERE` arrives
+    here with an empty `WHERE` and the filter one level down -- and reading only the
+    `WHERE` meant the same predicate pruned three files as a `LEFT JOIN` and none as
+    an `INNER JOIN` (FINDINGS.md 3.5).
+
+    Which side an `ON` clause filters is the whole subtlety, because a join preserves
+    one side and filters the other:
+
+        INNER / CROSS   both sides -- an unmatched row of either is simply gone
+        LEFT            the right only; left rows survive unmatched, null-padded
+        RIGHT           the left only, for the mirror-image reason
+        FULL            neither
+
+    On the filtered side the conjunct is applied to rows read from the table, before
+    any null-padding, so -- unlike a `WHERE` conjunct over a null-padded alias -- it
+    needs no `is_null_rejecting` gate. On the preserved side it is not a filter at
+    all and must not prune. Anything whose shape is not on that list (a semi or anti
+    join, a lateral) yields nothing, which costs pruning and never correctness.
+    """
+    if not isinstance(expression, exp.Select):
+        return {}
+
+    terms: dict[str, list[exp.Expression]] = {}
+    left: list[str] = []
+    source = _from_table(expression)
+    if source is not None:
+        left.append(source.alias_or_name)
+
+    for join in expression.args.get("joins") or []:
+        right = join.this.alias_or_name
+        side = str(join.args.get("side") or "").upper()
+        kind = str(join.args.get("kind") or "").upper()
+        on = join.args.get("on")
+
+        filtered: list[str] = []
+        if kind in ("", "INNER", "OUTER"):
+            if side == "":
+                filtered = [*left, right]
+            elif side == "LEFT":
+                filtered = [right]
+            elif side == "RIGHT":
+                filtered = list(left)
+            # FULL preserves both sides, so its ON clause filters neither.
+
+        if on is not None:
+            for alias in filtered:
+                terms.setdefault(alias, []).extend(conjuncts(on))
+        left.append(right)
+
+    return terms
 
 
 def is_null_rejecting(node: exp.Expression) -> bool:
@@ -542,7 +615,9 @@ def extract_scan_requests(
 
     for scope in traverse_scope(optimized):
         terms = conjuncts(scope.expression.args.get("where"))
-        padded = null_padded_aliases(as_expression(scope.expression))
+        scope_expression = as_expression(scope.expression)
+        padded = null_padded_aliases(scope_expression)
+        on_terms = join_predicates(scope_expression)
 
         for alias, node in scope.sources.items():
             if not isinstance(node, exp.Table) or isinstance(node.this, exp.Func):
@@ -561,6 +636,9 @@ def extract_scan_requests(
             usable = (
                 [term for term in terms if is_null_rejecting(term)] if alias in padded else terms
             )
+            # An `ON` conjunct on the side the join filters is a filter on this
+            # table's own rows, whether or not the other side null-pads it.
+            usable = [*usable, *on_terms.get(alias, [])]
             predicate, _, dropped = scope_predicate(usable, resolver, schema)
             # A term mentioning another table is not "unpushed" for this one, it is
             # simply none of its business, so it is not reported against it.

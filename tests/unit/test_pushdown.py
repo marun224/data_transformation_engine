@@ -19,12 +19,14 @@ from pyiceberg import types as ice
 from pyiceberg.expressions import AlwaysTrue, And, BooleanExpression, Not, Or
 from pyiceberg.schema import Schema
 
+from icetl.plan.builder import as_expression
 from icetl.plan.describe import describe_predicate
 from icetl.plan.pushdown import (
     ColumnResolver,
     binds_against,
     conjuncts,
     is_exactly_translatable,
+    join_predicates,
     scope_predicate,
     translate_predicate,
 )
@@ -420,3 +422,55 @@ class TestScopePredicate:
         assert kept == ["id = 1"]
         assert dropped == ["other.x = 2"]
         assert predicate == EqualTo("id", 1)
+
+
+class TestJoinPredicates:
+    """Which side of a join its `ON` clause is allowed to prune.
+
+    The rule is one sentence -- a join filters the side it does not preserve -- and
+    every case below is that sentence applied. FINDINGS.md 3.5.
+    """
+
+    @staticmethod
+    def terms(sql: str) -> dict[str, list[str]]:
+        parsed = as_expression(sqlglot.parse_one(sql, read="duckdb"))
+        return {
+            alias: [term.sql(dialect="duckdb") for term in found]
+            for alias, found in join_predicates(parsed).items()
+        }
+
+    def test_an_inner_join_filters_both_sides(self) -> None:
+        found = self.terms("SELECT * FROM a INNER JOIN b ON a.id = b.id AND b.d = '1'")
+        assert set(found) == {"a", "b"}
+        assert sorted(found["b"]) == ["a.id = b.id", "b.d = '1'"]
+
+    def test_a_left_join_filters_only_the_right(self) -> None:
+        found = self.terms("SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.d = '1'")
+        assert set(found) == {"b"}
+
+    def test_a_right_join_filters_only_the_left(self) -> None:
+        found = self.terms("SELECT * FROM a RIGHT JOIN b ON a.id = b.id")
+        assert set(found) == {"a"}
+
+    def test_a_full_join_filters_neither(self) -> None:
+        assert self.terms("SELECT * FROM a FULL JOIN b ON a.id = b.id") == {}
+
+    def test_an_earlier_table_is_filtered_by_a_later_inner_join(self) -> None:
+        """`a` survives the second join only if it matched, so its ON filters `a` too."""
+        found = self.terms("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON a.k = c.k")
+        assert sorted(found["a"]) == ["a.id = b.id", "a.k = c.k"]
+
+    def test_a_left_join_after_an_inner_one_still_preserves_its_left(self) -> None:
+        found = self.terms("SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON a.k = c.k")
+        assert found["c"] == ["a.k = c.k"]
+        assert found["a"] == ["a.id = b.id"]
+
+    def test_a_cross_join_has_no_on_clause_to_read(self) -> None:
+        assert self.terms("SELECT * FROM a CROSS JOIN b") == {}
+
+    def test_an_unrecognised_join_shape_yields_nothing(self) -> None:
+        """Conservative by default: no terms costs pruning, never correctness."""
+        assert self.terms("SELECT * FROM a SEMI JOIN b ON a.id = b.id") == {}
+
+    def test_a_plan_with_no_join_yields_nothing(self) -> None:
+        assert self.terms("SELECT * FROM a WHERE a.id = 1") == {}

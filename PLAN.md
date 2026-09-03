@@ -497,21 +497,33 @@ returns the same thing as the DataFrame equivalent.
   `TIMESTAMP AS OF`; metadata tables (`.snapshots`, `.files`, `.history`,
   `.manifests`, `.partitions`).
 
-### Phase 10 — Performance & scale
-- Memory: DuckDB `memory_limit` + `temp_directory` spill, sized from available RAM.
-- Parallelism: threads = physical cores, no user config (P7).
-- Wide-table benchmark harness against a 200-col fixture, then your real table.
-- Result streaming (`toLocalIterator`, chunked Arrow) so big results never OOM.
-- Query cache for repeated identical plans; catalog/schema caching with TTL.
-- Benchmarks committed as a tracked file so regressions are visible.
+### Phase 10 — Performance & scale *(DONE 2026-09-02)*
+- ~~Memory: `memory_limit` sized from available RAM~~ — **declined, decision 17.** Spill
+  is configured and now measured (FINDINGS §4.8): the same query fails without a temp
+  directory and succeeds with one.
+- ~~Parallelism: threads = physical cores~~ — **declined, decision 17.** Measured
+  indistinguishable from DuckDB's default; oversubscribing is the only thing that hurts.
+- Wide-table benchmark harness — `scripts/benchmark.py`, results in `BENCHMARKS.md`.
+- Result streaming — `toArrowBatches()` / `toLocalIterator()`, with a guard against the
+  silent truncation DuckDB performs when a stream's cursor runs another query.
+- Schema caching, keyed on Iceberg's `schema_id` rather than a TTL (17 ms → 0.4 ms). The
+  **query cache is not built**; STATUS.md says why.
+- Benchmarks committed as a tracked file — `BENCHMARKS.md`.
 
-### Phase 11 — Extras
-- Python UDFs + `pandas_udf` via DuckDB scalar/Arrow UDF registration.
-- `io/maintenance.py`: compaction (`rewrite_data_files` with sort order),
-  `expire_snapshots`, `rewrite_manifests`, orphan-file cleanup — single-node,
-  no Spark. Directly serves the securities-table workload.
-- Non-Iceberg sources (`spark.read.parquet/csv/json`) as convenience readers.
-- `notebooks/00_quickstart.ipynb` and the user guide.
+Also closed here: FINDINGS §3.3, §3.4 and §3.5, carried in from Phases 2 and 9. Found
+here: §1.12 and §1.13, two silent wrong answers that predated the phase.
+
+### Phase 11 — Extras *(DONE 2026-09-02)*
+- Python UDFs + vectorised UDFs through DuckDB's native and Arrow registration, on
+  both surfaces. The null handling took measuring: FINDINGS §2.9.
+- `io/maintenance.py` — `compact()`, `expireSnapshots()`, `removeOrphanFiles()`.
+  PyIceberg 0.11 provides only the second (§4.9), so the rest are built.
+  ~~`rewrite_manifests`~~ — **refused**: a hand-written manifest fails silently by
+  hiding data files.
+- Non-Iceberg readers — `session.read.parquet/csv/json`. Object-store paths refused,
+  because the schema binds on a connection without S3 credentials.
+- `notebooks/00_quickstart.ipynb` and `GUIDE.md`. Every notebook cell is run, which
+  is what found §2.10.
 
 ### Phase 12 — Merge-on-read reads *(deferred from Phase 2 by decision 11)*
 
@@ -685,6 +697,7 @@ until this lands.
 | 12 | **Build the function library; use SQLFrame as a reference, not a dependency** (2026-08-30). Settles decision 8. Neither SQLFrame nor `duckdb.experimental.spark` implements Spark conformance — both return `inf` for `1/0`, both raise on `CAST('abc' AS INT)`, neither emits explicit NULLS FIRST/LAST — so §3.5 is ours either way, and neither can read Iceberg through our planner. SQLFrame also pins `sqlglot<30.13` against our 30.17. Its 478 function→sqlglot-node mappings are read as a lookup table (MIT); nothing is imported. |
 | 15 | **The PySpark compatibility surface is dropped** (2026-08-30). Supersedes decisions 1 and 8. icetl is an Iceberg + DuckDB library and no longer presents itself as Spark: `SparkSession` → `Session`, `PySpark*Error` → `Engine*Error`, the shadow `src/pyspark` package is deleted, `spark.*` config keys are replaced by `icetl.*` twins, and `F.spark_partition_id` is removed (273 names). **What stays, deliberately:** Spark 3.5 remains the *semantic* reference (P5) under the neutral name *the reference*, because having a written spec beats deciding each edge case ad hoc; and sqlglot's `"spark"` dialect stays, bound to `SQL_DIALECT`, because it names a SQL *grammar* — changing it would change the language accepted, not the branding. **What this costs:** any script doing `from pyspark.sql import SparkSession`, catching `PySparkTypeError`, or passing `spark.*` keys to `.config()` breaks. That is the intent, and no test covered the shadow package, so nothing in the suite regressed. |
 | 16 | **SQL-surface function resolution deferred to Phase 15** (2026-08-30). Functions whose reference behaviour comes from composition in `sql/functions.py` are reachable only through `F.*`; a bare name in `Session.sql()` goes to DuckDB. Of a 17-case sample: 2 answer **silently differently** (`weekday`, `dayofweek` — off by one), 9 raise because DuckDB has no such function, 1 (`size(NULL)`) is wrong on both. **Deferred, not dropped** — the fix is a resolution hook plus an exhaustive both-surfaces test, and it is worth doing as its own piece rather than inside Phase 4. **No guard**, unlike decision 11: detecting the divergence means evaluating both surfaces, which is the test, which is the fix. `compat/divergence.md` is the warning instead. **What this costs:** P1 is stated over both surfaces and does not currently hold for these names. |
+| 17 | **DuckDB sizes its own threads and memory** (2026-09-02). Supersedes Phase 10's first two bullets. `--compare-threads 2 4 8 16` over the benchmark suite: 2, 4 and 8 are indistinguishable, 16 is worse across every case. Physical cores (4) and DuckDB's default (8) differ by less than the run-to-run spread, so pinning threads would buy a configuration surface and a portable-core-count dependency for no measurable gain. Memory likewise: DuckDB already takes ~80% of total RAM, and the thing that turns an OOM into a completed query is the **spill directory**, which is configured and measured (§4.8). **What this costs:** on a machine where another process holds most of the RAM, 80%-of-total is an over-commitment icetl will not notice — an `Out of Memory` from DuckDB, not a wrong answer, and one line to fix. Documented rather than guarded; revisit with a measurement, which `scripts/benchmark.py` exists to take. |
 | 11 | **Copy-on-write for now; merge-on-read deferred** (2026-08-30). Every writer of the tables in scope rewrites data files, so no delete or position files exist and §3.3's hybrid split is not built. **Deferred, not dropped** — MoR *reading* is Phase 12, MoR *writing* is Phase 13. The assumption is asserted at scan time rather than trusted, because `read_parquet` cannot see a delete file and would return deleted rows reporting success. Phase 8 writes COW, which is what PyIceberg does natively. |
 
 ### Still open

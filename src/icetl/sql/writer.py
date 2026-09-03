@@ -451,6 +451,23 @@ def commit_with_retry(operation: Callable[[], None]) -> None:
             if attempt == _COMMIT_ATTEMPTS - 1:
                 raise
             time.sleep(_COMMIT_BACKOFF_SECONDS * (2**attempt))
+        except UnicodeEncodeError as exc:
+            # PyIceberg renders a schema mismatch as a `rich` table of tick and cross
+            # marks, printed to stdout *before* it raises. On a Windows console using
+            # cp1252 that print raises `UnicodeEncodeError` first -- so the mismatch
+            # never gets reported and the caller is told about a codec instead, having
+            # watched half a table scroll past. FINDINGS.md 2.10.
+            #
+            # The real error cannot be recovered, because PyIceberg was still building
+            # it. Saying what happened is what is available, and it is a great deal
+            # better than a charmap complaint.
+            raise AnalysisException(
+                "The data does not match the table's schema. PyIceberg reports the "
+                "difference as a table of Unicode marks, and printing it failed on "
+                "this console's encoding, so its own message is unavailable -- "
+                f"({exc}). Compare df.schema against the table's, or re-run with "
+                "PYTHONIOENCODING=utf-8 to see PyIceberg's report."
+            ) from exc
         except ValueError as exc:
             # PyIceberg validates the incoming schema against the table's and reports a
             # mismatch as a bare `ValueError` -- a required field given a NULL, a column

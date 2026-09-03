@@ -36,6 +36,7 @@ from sqlglot.optimizer.pushdown_projections import pushdown_projections
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.simplify import simplify
 
+from icetl.plan.cardinality import contains_generator
 from icetl.plan.schema import DIALECT
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
 
     from sqlglot.schema import MappingSchema
 
-__all__ = ["RULES", "OptimizedPlan", "optimize_plan"]
+__all__ = ["RULES", "UNSAFE_WITH_GENERATORS", "OptimizedPlan", "optimize_plan"]
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,27 @@ RULES: tuple[str, ...] = (
     "merge_subqueries",
     # Constant folding and predicate tidying, last so it sees the merged tree.
     "simplify",
+)
+
+#: Rules that move a projection out of the scope that defines it. Each is sound for a
+#: scalar expression and unsound for a generator, and each was caught doing something
+#: different with the same `unnest`:
+#:
+#:     pushdown_projections   replaced the unreferenced generator with `1 AS _`, so
+#:                            `count()` over an exploded frame returned the *table's*
+#:                            row count -- silently
+#:     pushdown_predicates    substituted the generator's alias with the generator and
+#:                            pushed it into a WHERE, which DuckDB rejects outright
+#:     merge_subqueries       merged the defining scope away entirely, dropping the
+#:                            generator with it
+#:
+#: Skipped together rather than singly: they are one assumption, and a plan that has
+#: lost two of the three is not a shape worth reasoning about separately. What this
+#: costs is subquery flattening on exploded queries -- scan pruning survives, because
+#: `plan/pushdown.py` reads the qualified tree itself rather than relying on these.
+#: See `plan/cardinality.py`.
+UNSAFE_WITH_GENERATORS = frozenset(
+    {"pushdown_projections", "pushdown_predicates", "merge_subqueries"}
 )
 
 
@@ -211,8 +233,15 @@ def optimize_plan(
     current = _close_always_true_branches(plan.copy())
     stages: list[str] = []
     note: str | None = None
+    skipped = UNSAFE_WITH_GENERATORS if contains_generator(current) else frozenset()
 
     for name in RULES:
+        if name in skipped:
+            note = (
+                "the plan contains a row-generating function, so the rules that move "
+                f"projections between scopes were skipped ({', '.join(sorted(skipped))})"
+            )
+            continue
         try:
             current = _apply(name, current, schema)
         except (OptimizeError, KeyError, ValueError, TypeError, ArithmeticError) as exc:

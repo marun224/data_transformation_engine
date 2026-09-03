@@ -402,3 +402,53 @@ class TestWriterRefusals:
         """The fixture session has a default namespace, so this needs a name with none."""
         with pytest.raises((AnalysisException, TableAlreadyExistsException)):
             session.table("fx.plain").write.saveAsTable("fx.plain")
+
+
+class TestASchemaMismatchStaysLegibleOnWindows:
+    """PyIceberg reports a schema mismatch by printing, and the print can fail first.
+
+    Its report is a `rich` table of tick and cross marks, written to stdout *before*
+    the exception is raised. On a Windows console using cp1252 that print raises
+    `UnicodeEncodeError`, which escapes ahead of the real error -- so a routine
+    mismatch is reported as a codec problem, after half a diagnostic table has
+    scrolled past. Reproducible with PyIceberg alone; FINDINGS.md 2.10.
+
+    The real message cannot be recovered, because PyIceberg was still assembling it.
+    Saying what actually happened is what is available, and it beats a charmap
+    complaint by a distance.
+    """
+
+    @staticmethod
+    def raising_operation() -> None:
+        # The shape PyIceberg's own failure takes: the tick mark its table is built
+        # from, against the encoding a Windows console offers.
+        "✅".encode("cp1252")
+
+    def test_it_becomes_an_analysis_exception(self) -> None:
+        from icetl.sql.writer import commit_with_retry
+
+        with pytest.raises(AnalysisException) as caught:
+            commit_with_retry(self.raising_operation)
+        assert "does not match the table's schema" in str(caught.value)
+
+    def test_it_says_how_to_see_the_real_report(self) -> None:
+        from icetl.sql.writer import commit_with_retry
+
+        with pytest.raises(AnalysisException, match="PYTHONIOENCODING"):
+            commit_with_retry(self.raising_operation)
+
+    def test_the_original_error_is_still_the_cause(self) -> None:
+        """Chained, so a caller who wants the codec detail can still reach it."""
+        from icetl.sql.writer import commit_with_retry
+
+        with pytest.raises(AnalysisException) as caught:
+            commit_with_retry(self.raising_operation)
+        assert isinstance(caught.value.__cause__, UnicodeEncodeError)
+
+    def test_an_ordinary_mismatch_still_reports_pyicebergs_message(
+        self, session: Session, target: str
+    ) -> None:
+        """The path FINDINGS 2.8 built: a `ValueError` keeps its own text."""
+        session.table("fx.plain").write.saveAsTable(target)
+        with pytest.raises(AnalysisException):
+            session.createDataFrame([(1,)], ["nope"]).write.mode("append").saveAsTable(target)

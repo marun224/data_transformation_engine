@@ -441,6 +441,156 @@ because they surprise people rather than because they differ:
 |---|---|---|---|
 | `monotonically_increasing_id` | monotonic and unique, not consecutive (a partition number is encoded in the high bits) | `row_number() OVER () - 1`, so consecutive here. Relying on that relies on more than either engine promises | ⚠️ |
 
+## User-defined functions — Phase 11
+
+### A NULL argument does not reach the function
+
+The reference calls a Python UDF with `None` and lets it decide. Here it does not, by
+default.
+
+| | the reference | icetl |
+|---|---|---|
+| `udf(lambda x: 1)("nullable_col")` on a NULL row | returns `1` | returns `NULL`, function not called |
+| `udf(lambda x: x * 2)` on a NULL row | raises inside the executor | returns `NULL` |
+
+**Not a preference.** DuckDB's two null-handling modes are each unusable alone
+(FINDINGS.md §2.9): `DEFAULT` forbids a UDF from *returning* NULL, which no general UDF
+can accept, and `SPECIAL` hands a UDF over `read_parquet` an extra row of NULLs the
+data never contained — so `udf(lambda x: x * 2)` would crash on every Iceberg scan.
+icetl registers as `SPECIAL` and wraps the function so an all-NULL call returns NULL
+without reaching it.
+
+Opt into the reference's behaviour where you want it:
+
+```python
+session.udf.register("or_zero", lambda v: 0 if v is None else v, "bigint", callOnNull=True)
+```
+
+Only a call whose arguments are **all** NULL is absorbed. A partially-NULL call is a
+real row and the function sees it, as the reference's does.
+
+### A `pandas_udf` sees NULLs, and one extra row
+
+A vector cannot skip an element, so a vectorised UDF always receives NULLs as missing
+values in the Series — closer to the reference than the scalar path. It also receives
+DuckDB's invented extra row; per-element pandas operations propagate NaN through it and
+DuckDB discards the result. A vectorised function that aggregates across the vector, or
+depends on its length, would see that extra element.
+
+### The return type is declared, never inferred
+
+The reference infers nothing either — its default is `StringType()` and so is ours —
+but it is worth stating: DuckDB needs the type before the first row, so a UDF whose
+declared type does not match what it returns produces a cast or an error, not a
+corrected type.
+
+### Re-registering a name replaces it
+
+As the reference does. DuckDB raises *A function by the name of 'x' is already
+created*, so the old registration is removed first. The analysed-schema cache is
+invalidated at the same time, because the same SQL with a new return type is the one
+case a SQL-keyed cache would answer wrongly.
+
+---
+
+## Table maintenance — Phase 11
+
+### `rewriteManifests()` is refused
+
+The reference rewrites manifests; PyIceberg 0.11 exposes no way to. Building it means
+writing manifest lists by hand, and a manifest that is subtly wrong does not fail — it
+makes data files invisible to every reader, which is data loss wearing the costume of a
+successful commit. `compact()` rewrites the manifests for the partitions it touches.
+
+### `removeOrphanFiles()` reports rather than deletes
+
+The reference deletes, with a retention period. Here `dryRun=True` is the default, and
+`olderThan` defaults to three days ago. A commit in flight writes its data files before
+referencing them, so "recent and unreferenced" describes live data as often as rubbish,
+and the deletion is unrecoverable. Local filesystems only: listing an object store is a
+different operation with different costs.
+
+### `compact()` works a partition at a time
+
+The reference's `rewrite_data_files` takes a file-group strategy and a target size.
+Here the unit is the **partition**, because that is what a single-node writer can
+replace atomically — `overwrite` with a filter naming the partition is one commit.
+Under a non-identity partition transform the partition value is not the column's value,
+so no such filter can be built and the whole table is rewritten in one commit instead.
+
+---
+
+## File readers — Phase 11
+
+### CSV type inference is on by default
+
+The reference's `inferSchema` defaults to false, reading every column as a string.
+DuckDB's sniffer is good and reading everything as text is rarely what anyone wants, so
+inference stays **on** unless `inferSchema=False` turns it off.
+
+The sniffer is good enough to surprise: `2026-08-17` becomes a `date`, and appending
+that to a table storing `string` is refused. Cast deliberately.
+
+### Object-store paths are refused
+
+The reference reads `s3://` as readily as a local path. Here the schema is bound on the
+analyzer's own DuckDB connection, which carries neither httpfs nor the S3 credentials
+the engine's connection is given — so a working execution would sit behind a failing
+analysis. Refused plainly. Iceberg data in object storage is read by name through
+`session.table()`, which is the path that has those credentials.
+
+### `session.read.schema()` is still refused
+
+Unchanged by Phase 11: an Iceberg table carries its own schema, and a file's is read
+from the file. To reshape a result, select and cast on the frame.
+
+---
+
+## Performance and streaming — Phase 10
+
+### `toLocalIterator()` must be finished before the next query
+
+The reference streams partitions from executors, so its iterator survives anything the
+driver does meanwhile. Here there is one DuckDB cursor, and DuckDB ends a result when
+that cursor runs the next query.
+
+| | the reference | icetl |
+|---|---|---|
+| run another query mid-iteration | the iterator continues | the stream **raises** |
+
+Left alone, DuckDB's behaviour is worse than either: the reader stops yielding and
+raises nothing, so a half-read stream reports its prefix as the whole answer. That is a
+silent truncation, so `exec/engine.py` counts queries per cursor and refuses a stream
+whose cursor has moved on. Collect first with `toArrow()` if you need to interleave.
+
+The stream cannot use its own connection instead: a registered Arrow table and a
+`CREATE TEMP TABLE` are both per-cursor in DuckDB, so a dedicated one would not see a
+cached frame, a `createDataFrame`, or a materialised metadata table.
+
+### `toArrowBatches()` has no counterpart
+
+An icetl addition, not a reference method. It yields `pyarrow.RecordBatch` as DuckDB
+produces them. On a wide result it is also the fast path by a wide margin — `collect()`
+spends most of its time building `Row` objects (FINDINGS §3.8) — so it is worth reaching
+for even when the result would fit.
+
+### `count()` may not touch a single file
+
+`SELECT count(*)` over an unfiltered scan is answered from Iceberg's manifests. The
+answer is identical; what differs is that a table whose data files have been deleted out
+from under it still counts, and a permissions or connectivity failure on the data path
+does not surface here. Any filter, join, limit, generator or aggregate takes the
+ordinary path.
+
+### `repartition()` and `coalesce()` remain no-ops
+
+Unchanged by Phase 10 and worth restating beside it: there is one partition here, and
+DuckDB parallelises within a query by itself. Phase 10 measured what thread count is
+worth setting and the answer was "whatever DuckDB chose" (decision 17), which is the
+same conclusion from the other direction.
+
+---
+
 ## Surface divergences — `Session.sql()` vs `F.*` ⚠️
 
 **P1 does not currently hold for function names** (decision 16, deferred to Phase 15).

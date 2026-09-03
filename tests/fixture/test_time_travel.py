@@ -179,11 +179,16 @@ class TestTheReader:
         base.option("snapshot-id", first)
         assert sorted(row[0] for row in base.table(name).collect()) == [1, 2, 3]
 
-    def test_a_file_format_points_at_phase_11(self, session: Session) -> None:
-        with pytest.raises(UnsupportedFeatureError, match="Phase 11"):
-            session.read.format("parquet")
+    def test_a_file_format_is_now_accepted(self, session: Session) -> None:
+        """Phase 11 built the file readers this used to be deferred to.
 
-    def test_load_points_at_table(self, session: Session) -> None:
+        The reader is shared by both jobs, so this is the check that adding formats
+        did not disturb the time-travel options -- `tests/fixture/test_file_readers.py`
+        is where the formats themselves are tested.
+        """
+        assert session.read.format("parquet") is not None
+
+    def test_load_without_a_format_still_points_at_table(self, session: Session) -> None:
         with pytest.raises(UnsupportedFeatureError, match=r"read\.table"):
             session.read.load("/tmp/x")
 

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.types import ListType, MapType, StructType
 
 from icetl.errors import UnsupportedFeatureError
 from icetl.paths import engine_paths
@@ -47,10 +48,27 @@ if TYPE_CHECKING:
 
     from icetl.plan.builder import ScanSource
 
-__all__ = ["ColumnAlias", "FileGroup", "ScanPlan", "plan_scan"]
+__all__ = ["ColumnAlias", "FileGroup", "ScanPlan", "format_bytes", "plan_scan"]
 
 # The parquet footer key Iceberg writes its field-ids under.
 _FIELD_ID_KEY = b"PARQUET:field_id"
+
+
+def format_bytes(count: int) -> str:
+    """Render a byte count at whatever scale makes it readable.
+
+    A fixed `MB` was the previous rendering and it flattened the very comparison it
+    was there to show: a two-column read of the 200-column fixture printed as
+    "0.0 MB of 0.1 MB", which is a 16x difference rounded into invisibility.
+    """
+    if count < 1024:
+        return f"{count} B"
+    for unit in ("KB", "MB", "GB"):
+        count_f = count / 1024
+        if count_f < 1024 or unit == "GB":
+            return f"{count_f:.1f} {unit}"
+        count = int(count_f)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @dataclass(frozen=True)
@@ -98,7 +116,15 @@ class ScanPlan:
     total_columns: int = 0
     files_scanned: int = 0
     files_total: int | None = None
+    #: Bytes of the selected *columns* in the selected files -- what will actually be
+    #: read. Falls back to `bytes_total` for a file whose manifest carries no column
+    #: sizes, so it is never an under-report.
     bytes_scanned: int = 0
+    #: Bytes of the selected files on disk, every column included.
+    bytes_total: int = 0
+    #: Rows in the selected files, summed from their manifest entries. Exact only
+    #: when nothing was pruned by a predicate -- see `metadata_row_count`.
+    records: int = 0
     pushed_filter: str | None = None
     unpushed_filters: tuple[str, ...] = ()
     renamed_columns: tuple[str, ...] = ()
@@ -106,6 +132,23 @@ class ScanPlan:
     @property
     def file_count(self) -> int:
         return self.files_scanned
+
+    @property
+    def metadata_row_count(self) -> int | None:
+        """The table's row count from its manifests, or None if metadata cannot say.
+
+        Iceberg records a `record_count` per data file, so an unfiltered count is a
+        sum over metadata already in hand rather than a parquet footer per file
+        (FINDINGS.md 3.4).
+
+        Refused the moment a predicate was pushed, because file pruning is an
+        *over*-approximation: `plan_files()` returns the files that may hold a
+        matching row, so summing their record counts under a filter would return a
+        number that is too big and look authoritative doing it.
+        """
+        if self.pushed_filter is not None or self.unpushed_filters:
+            return None
+        return self.records
 
     @property
     def is_empty(self) -> bool:
@@ -125,7 +168,14 @@ class ScanPlan:
             if self.files_total is not None
             else f"{self.files_scanned} file(s)"
         )
-        return f"{files}, {self.bytes_scanned / 1e6:.1f} MB"
+        if self.bytes_total and self.bytes_scanned != self.bytes_total:
+            # Both numbers, because one alone cannot say whether pruning worked. The
+            # gap is column pruning: reporting only the file size made a query
+            # reading 2 of 200 columns look as expensive as one reading all of them
+            # (FINDINGS.md 3.3).
+            read = format_bytes(self.bytes_scanned)
+            return f"{files}, {read} of {format_bytes(self.bytes_total)}"
+        return f"{files}, {format_bytes(self.bytes_scanned)}"
 
     def describe_columns(self) -> str:
         return f"{len(self.columns)} of {self.total_columns}: {', '.join(self.columns)}"
@@ -256,6 +306,63 @@ def _grouped_by_stored_names(
     return tuple(groups)
 
 
+def _contained_field_ids(field_type: object) -> set[int]:
+    """Every field-id inside a type, including the ids of its nested parts.
+
+    A parquet file stores a struct, list or map as several leaf columns, and the
+    manifest sizes them by *leaf* field-id -- so selecting `person` means paying for
+    `person.name` and `person.age`, and a size read from the top-level id alone would
+    be zero.
+    """
+    ids: set[int] = set()
+    if isinstance(field_type, StructType):
+        for nested in field_type.fields:
+            ids.add(nested.field_id)
+            ids |= _contained_field_ids(nested.field_type)
+    elif isinstance(field_type, ListType):
+        ids.add(field_type.element_id)
+        ids |= _contained_field_ids(field_type.element_type)
+    elif isinstance(field_type, MapType):
+        ids.add(field_type.key_id)
+        ids.add(field_type.value_id)
+        ids |= _contained_field_ids(field_type.key_type)
+        ids |= _contained_field_ids(field_type.value_type)
+    return ids
+
+
+def _selected_field_ids(schema: IcebergSchema, columns: tuple[str, ...]) -> set[int]:
+    """The field-ids the selected columns occupy, nested parts included."""
+    wanted = {name.lower() for name in columns}
+    ids: set[int] = set()
+    for nested in schema.fields:
+        if nested.name.lower() in wanted:
+            ids.add(nested.field_id)
+            ids |= _contained_field_ids(nested.field_type)
+    return ids
+
+
+def _bytes_read(tasks: list, field_ids: set[int]) -> int:
+    """How many bytes the selected columns occupy across `tasks`.
+
+    Iceberg's manifests carry a compressed size per column, so this is the honest
+    answer to "how much will this query read" -- where the file size answers "how
+    much of the table did we fail to prune". Both are worth printing and they are not
+    the same number: on the 200-column fixture a two-column read is a few percent of
+    the file.
+
+    A file whose manifest carries no column sizes -- an older writer, or one that
+    omits them -- falls back to its own size, which over-reports rather than under.
+    """
+    total = 0
+    for task in tasks:
+        sizes = task.file.column_sizes
+        if not sizes:
+            total += task.file.file_size_in_bytes
+            continue
+        total += sum(size for field_id, size in sizes.items() if field_id in field_ids)
+    return total
+
+
 def _total_data_files(table: Table) -> int | None:
     """How many data files the current snapshot has, from its summary.
 
@@ -353,7 +460,9 @@ def plan_scan(source: ScanSource, request: ScanRequest | None = None) -> ScanPla
         total_columns=len(schema.fields),
         files_scanned=len(tasks),
         files_total=_total_data_files(table),
-        bytes_scanned=sum(task.file.file_size_in_bytes for task in tasks),
+        bytes_scanned=_bytes_read(tasks, _selected_field_ids(schema, columns)),
+        bytes_total=sum(task.file.file_size_in_bytes for task in tasks),
+        records=sum(task.file.record_count for task in tasks),
         pushed_filter=(
             None
             if isinstance(request.predicate, AlwaysTrue)

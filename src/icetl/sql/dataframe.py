@@ -34,6 +34,7 @@ from icetl.errors import (
     ParseException,
     UnsupportedFeatureError,
 )
+from icetl.exec.engine import DEFAULT_BATCH_ROWS
 from icetl.exec.result import format_show, to_pandas, to_rows
 from icetl.plan.builder import as_expression, wrap_as_subquery
 from icetl.sql.column import Column
@@ -44,7 +45,7 @@ from icetl.sql.stat import DataFrameStatFunctions
 from icetl.types import Row, StructType
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     import pandas as pd
     import pyarrow as pa
@@ -1101,6 +1102,39 @@ class DataFrame:
     def toPandas(self) -> pd.DataFrame:
         """The whole result as a pandas DataFrame."""
         return to_pandas(self._execute())
+
+    def toArrowBatches(self, batchSize: int = DEFAULT_BATCH_ROWS) -> Iterator[pa.RecordBatch]:
+        """Stream the result as Arrow batches, so a large one never has to fit in RAM.
+
+        The batches arrive as DuckDB produces them, which is what makes this different
+        from `toArrow()` in the only way that matters on the 250M-row table: peak
+        memory is one batch, not the whole result.
+
+        **Finish iterating before running another query on this session.** DuckDB ends
+        a result when its cursor runs the next one, so a half-read stream is a prefix
+        of the answer rather than the answer -- and, left to itself, it would end
+        early and report success. It refuses instead; `exec/engine.py` says how.
+        """
+        if not isinstance(batchSize, int) or isinstance(batchSize, bool) or batchSize < 1:
+            raise EngineValueError(
+                f"toArrowBatches() expects a positive batch size, got {batchSize!r}."
+            )
+        return self._session._stream(self._plan, self._sources, self.columns, batch_size=batchSize)
+
+    def toLocalIterator(self, batchSize: int = DEFAULT_BATCH_ROWS) -> Iterator[Row]:
+        """Stream the result one `Row` at a time, holding a batch in memory rather than all of it.
+
+        `collect()` for a result that does not fit. The conversion to `Row` happens a
+        batch at a time, so the Python objects for a batch are the high-water mark.
+
+        The same rule as `toArrowBatches` applies: finish iterating before running
+        another query on this session.
+        """
+        import pyarrow
+
+        schema = self.schema
+        for batch in self.toArrowBatches(batchSize):
+            yield from to_rows(pyarrow.Table.from_batches([batch], batch.schema), schema)
 
     def take(self, num: int) -> list[Row]:
         """The first `num` rows."""

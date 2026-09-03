@@ -26,15 +26,23 @@ from icetl.errors import QueryExecutionException
 from icetl.paths import is_object_store
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import pyarrow as pa
 
-__all__ = ["DuckDBEngine"]
+__all__ = ["DEFAULT_BATCH_ROWS", "DuckDBEngine"]
 
 logger = logging.getLogger(__name__)
 
 # One secret name, replaced rather than accumulated, so credentials cannot pile up
 # in a long-lived session.
 _S3_SECRET_NAME = "icetl_s3"
+
+#: Rows per batch when streaming. Large enough that per-batch overhead disappears,
+#: small enough that one batch of a wide row is megabytes rather than gigabytes --
+#: 200 columns of 8 bytes at this size is about 200 MB, which is the number that
+#: matters for the table Phase 10 exists for.
+DEFAULT_BATCH_ROWS = 131_072
 
 
 def _quote(value: str) -> str:
@@ -94,7 +102,19 @@ class DuckDBEngine:
         if existing is None:
             existing = self.connection.cursor()
             self._local.cursor = existing
+            self._local.generation = 0
         return existing
+
+    def _next_generation(self) -> int:
+        """Record that this thread's cursor is about to run a new query.
+
+        Per-thread, not per-engine: cursors are thread-local, so a query on one
+        thread does not invalidate a stream being read on another, and counting them
+        together would refuse a stream that was never in danger.
+        """
+        generation = getattr(self._local, "generation", 0) + 1
+        self._local.generation = generation
+        return generation
 
     def close(self) -> None:
         with self._lock:
@@ -178,6 +198,7 @@ class DuckDBEngine:
     ) -> duckdb.DuckDBPyConnection:
         """Run `sql`, translating DuckDB errors into the engine error hierarchy."""
         cursor = self.cursor()
+        self._next_generation()
         try:
             return (
                 cursor.execute(sql, parameters) if parameters is not None else cursor.execute(sql)
@@ -198,7 +219,59 @@ class DuckDBEngine:
         sql: str,
         parameters: dict[str, Any] | list[Any] | None = None,
         *,
-        batch_size: int = 1_000_000,
-    ) -> pa.RecordBatchReader:
-        """Run `sql` and stream the result, so large results never materialise."""
-        return self.execute(sql, parameters).to_arrow_reader(batch_size)
+        batch_size: int = DEFAULT_BATCH_ROWS,
+    ) -> Iterator[pa.RecordBatch]:
+        """Run `sql` and yield the result in batches, so a large one never materialises.
+
+        Runs on the calling thread's shared cursor, which it has to: a registered
+        Arrow table and a `CREATE TEMP TABLE` are both **per-cursor** in DuckDB, so a
+        dedicated connection would not see a cached frame, a `createDataFrame`, an
+        inlined metadata table, or the empty-table stand-in a pruned-to-nothing scan
+        substitutes. A stream that cannot read half the session's relations is not a
+        stream worth having.
+
+        Sharing the cursor costs this: DuckDB invalidates a result when the next
+        query runs on the same cursor, and it does so **silently** -- the reader
+        simply stops, and a partially consumed one reports zero further rows rather
+        than raising. Iterating lazily is the entire point of a stream, so running
+        another query mid-iteration is a thing callers will do.
+
+        So it is guarded rather than documented. Every `execute` bumps a counter; each
+        batch checks it, and a stream whose cursor has moved on refuses instead of
+        ending early. A truncated result that reports success is the failure mode this
+        codebase treats as worst (FINDINGS.md 6, rule 4).
+        """
+        cursor = self.cursor()
+        generation = self._next_generation()
+        try:
+            result = (
+                cursor.execute(sql, parameters) if parameters is not None else cursor.execute(sql)
+            )
+            reader = result.to_arrow_reader(batch_size)
+        except duckdb.Error as exc:
+            raise QueryExecutionException(f"{type(exc).__name__}: {exc}") from exc
+        return self._guarded(reader, generation)
+
+    def _guarded(self, reader: pa.RecordBatchReader, generation: int) -> Iterator[pa.RecordBatch]:
+        """Yield from `reader`, refusing to continue if the cursor has been reused.
+
+        The check happens **before** each batch is pulled, not after one is handed
+        out. An invalidated reader does not error and does not yield -- it simply
+        reports that it is finished -- so a check inside the loop body is never
+        reached in the very case it exists for. Ask first, then pull.
+        """
+        while True:
+            if getattr(self._local, "generation", -1) != generation:
+                raise QueryExecutionException(
+                    "This stream was invalidated by another query on the same session. "
+                    "DuckDB ends a result when its cursor runs the next query, and it "
+                    "does so without an error -- so the rows already yielded are a "
+                    "prefix of the answer, not the answer. Either finish iterating "
+                    "before running anything else, or collect the result first with "
+                    "toArrow()."
+                )
+            try:
+                batch = next(reader)
+            except StopIteration:
+                return
+            yield batch
