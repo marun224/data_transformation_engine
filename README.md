@@ -102,6 +102,27 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy
 ```
 
+### Two test tiers
+
 Tests marked `integration` are deselected by default; everything else runs against a
 local PyIceberg `SqlCatalog` (sqlite metadata, local-filesystem warehouse) with
 generated fixture tables.
+
+```bash
+uv run pytest                                  # 1679 local tests, offline, ~2 min
+uv run pytest -m "integration and not slow"    #  724 against the real catalog, ~3 min
+uv run pytest -m integration                   #  737, adding the 41M-row scans
+uv run pytest -m integration --it-reseed       #  rebuild the seed tables first
+```
+
+The integration tier talks to the REST catalog and object store named in `.env`. It
+builds its own tables in `icetl_it` — replicas of the six local fixtures, plus slices of
+real data carved out of `nyc.yellow_tripdata` — and never writes anywhere else: a
+namespace guard refuses it, and a session-scoped witness reads every protected table's
+snapshot id before and after the run and fails if either moved.
+
+Both tiers assert the same behaviours. What differs is everything underneath — a REST
+catalog rather than sqlite, MinIO rather than a temp directory, `s3://` paths, real
+NULLs, real cardinality, 62-file scans. That is where the defects have been: five of
+them are recorded in [FINDINGS.md](FINDINGS.md) §1.14, §1.15, §2.11, §2.12 and §2.13,
+and none was reachable offline.

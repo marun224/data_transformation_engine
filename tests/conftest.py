@@ -25,6 +25,21 @@ if TYPE_CHECKING:
     from pyiceberg.catalog.sql import SqlCatalog
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Options for the integration suite.
+
+    Declared here rather than in `tests/integration/conftest.py` because pytest only
+    calls `pytest_addoption` on *initial* conftests -- the rootdir's and the ones on
+    the collected paths -- and a nested conftest is loaded too late to add an option.
+    """
+    parser.addoption(
+        "--it-reseed",
+        action="store_true",
+        default=False,
+        help="integration suite: rebuild the seed tables instead of reusing them",
+    )
+
+
 @pytest.fixture(scope="session")
 def warehouse_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("warehouse")

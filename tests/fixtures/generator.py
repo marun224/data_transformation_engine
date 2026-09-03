@@ -15,10 +15,9 @@ out as risky, so those paths have coverage before the code that handles them exi
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -84,6 +83,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "FIXTURE_BUILDERS",
+    "FixtureBuilder",
     "FixtureTable",
     "build_all",
     "local_catalog",
@@ -140,14 +140,14 @@ def local_catalog(root: Path, name: str = "test") -> SqlCatalog:
 # ---------------------------------------------------------------------------
 
 
-def build_plain(catalog: Catalog) -> FixtureTable:
+def build_plain(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """Baseline: a few columns, one snapshot, no partitioning, no deletes."""
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "vendor", StringType(), required=False),
         NestedField(3, "amount", DoubleType(), required=False),
     )
-    identifier = f"{NAMESPACE}.plain"
+    identifier = f"{namespace}.plain"
     table = catalog.create_table(identifier, schema=schema)
     data = pa.table(
         {
@@ -161,7 +161,7 @@ def build_plain(catalog: Catalog) -> FixtureTable:
     return FixtureTable(identifier, table, rows=5, note="nulls in vendor and amount")
 
 
-def build_partitioned(catalog: Catalog) -> FixtureTable:
+def build_partitioned(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """Identity-partitioned, several partitions, several files."""
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
@@ -171,7 +171,7 @@ def build_partitioned(catalog: Catalog) -> FixtureTable:
     spec = PartitionSpec(
         PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="as_at_date")
     )
-    identifier = f"{NAMESPACE}.partitioned"
+    identifier = f"{namespace}.partitioned"
     table = catalog.create_table(identifier, schema=schema, partition_spec=spec)
 
     dates = ["2026-08-15", "2026-08-16", "2026-08-17"]
@@ -193,7 +193,7 @@ def build_partitioned(catalog: Catalog) -> FixtureTable:
     return FixtureTable(identifier, table, rows=rows, note=f"{len(dates)} partitions")
 
 
-def build_wide(catalog: Catalog) -> FixtureTable:
+def build_wide(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """200 columns. Reading this with `SELECT *` is the anti-pattern (3.6)."""
     fields = [NestedField(1, "id", LongType(), required=False)]
     fields += [
@@ -201,7 +201,7 @@ def build_wide(catalog: Catalog) -> FixtureTable:
         for i in range(2, WIDE_COLUMN_COUNT + 1)
     ]
     schema = Schema(*fields)
-    identifier = f"{NAMESPACE}.wide"
+    identifier = f"{namespace}.wide"
     table = catalog.create_table(identifier, schema=schema)
 
     row_count = 500
@@ -212,7 +212,7 @@ def build_wide(catalog: Catalog) -> FixtureTable:
     return FixtureTable(identifier, table, rows=row_count, note=f"{WIDE_COLUMN_COUNT} columns")
 
 
-def build_nested(catalog: Catalog) -> FixtureTable:
+def build_nested(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """Struct, list, and map columns, for the Phase 6 work."""
     schema = Schema(
         NestedField(1, "id", LongType(), required=False),
@@ -244,7 +244,7 @@ def build_nested(catalog: Catalog) -> FixtureTable:
             required=False,
         ),
     )
-    identifier = f"{NAMESPACE}.nested"
+    identifier = f"{namespace}.nested"
     table = catalog.create_table(identifier, schema=schema)
     # Plain Python values with an explicit schema: inference would read the map column
     # as a list of tuples rather than a map.
@@ -261,7 +261,7 @@ def build_nested(catalog: Catalog) -> FixtureTable:
     return FixtureTable(identifier, table, rows=2, note="struct, list, map")
 
 
-def build_renamed(catalog: Catalog) -> FixtureTable:
+def build_renamed(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """A column renamed between two appends -- the silent-wrong-results case (3.4).
 
     After this runs the table holds two data files: the first written when field 2 was
@@ -273,7 +273,7 @@ def build_renamed(catalog: Catalog) -> FixtureTable:
         NestedField(1, "id", LongType(), required=False),
         NestedField(2, "old_name", StringType(), required=False),
     )
-    identifier = f"{NAMESPACE}.renamed"
+    identifier = f"{namespace}.renamed"
     table = catalog.create_table(identifier, schema=schema)
     table.append(
         pa.table(
@@ -294,7 +294,7 @@ def build_renamed(catalog: Catalog) -> FixtureTable:
     return FixtureTable(identifier, table, rows=4, note="2 rows written as old_name, 2 as new_name")
 
 
-def build_mor(catalog: Catalog) -> FixtureTable:
+def build_mor(catalog: Catalog, *, namespace: str = NAMESPACE) -> FixtureTable:
     """A table with merge-on-read positional deletes -- the case decision 11 forbids.
 
     icetl assumes copy-on-write, so nothing here reads this table successfully. It
@@ -320,7 +320,7 @@ def build_mor(catalog: Catalog) -> FixtureTable:
         NestedField(2, "vendor", StringType(), required=False),
         NestedField(3, "amount", DoubleType(), required=False),
     )
-    identifier = f"{NAMESPACE}.mor"
+    identifier = f"{namespace}.mor"
     table = catalog.create_table(identifier, schema=schema)
     table.append(
         pa.table(
@@ -431,7 +431,18 @@ def build_mor(catalog: Catalog) -> FixtureTable:
     )
 
 
-FIXTURE_BUILDERS: dict[str, Callable[[Catalog], FixtureTable]] = {
+class FixtureBuilder(Protocol):
+    """The shape every builder above shares.
+
+    Spelled as a Protocol rather than a `Callable` alias because the namespace is
+    keyword-only, which `Callable[...]` cannot express -- and it is the whole reason
+    the parameter exists, so it should be in the type.
+    """
+
+    def __call__(self, catalog: Catalog, *, namespace: str = ...) -> FixtureTable: ...
+
+
+FIXTURE_BUILDERS: dict[str, FixtureBuilder] = {
     "plain": build_plain,
     "partitioned": build_partitioned,
     "wide": build_wide,
@@ -441,6 +452,15 @@ FIXTURE_BUILDERS: dict[str, Callable[[Catalog], FixtureTable]] = {
 }
 
 
-def build_all(catalog: Catalog) -> dict[str, FixtureTable]:
-    """Build every fixture table into `catalog`."""
-    return {name: builder(catalog) for name, builder in FIXTURE_BUILDERS.items()}
+def build_all(catalog: Catalog, *, namespace: str = NAMESPACE) -> dict[str, FixtureTable]:
+    """Build every fixture table into `catalog`, under `namespace`.
+
+    The namespace is a parameter because these fixtures are worth having twice: once
+    in the local sqlite catalog the default suite runs against, and once in a real
+    REST catalog, where the same known-contents tables become the only way to assert
+    *exact* values against real infrastructure -- real object store, real `s3://`
+    path translation, real parquet. See `tests/integration/seed.py`.
+    """
+    return {
+        name: builder(catalog, namespace=namespace) for name, builder in FIXTURE_BUILDERS.items()
+    }

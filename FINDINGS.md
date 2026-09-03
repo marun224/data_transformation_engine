@@ -305,6 +305,57 @@ tree itself rather than relying on those rules.
 **Why it lasted two phases:** every Phase 6 test asserted on `collect()`, which was
 right. Nothing asked the same frame two different questions and compared the answers.
 
+### 1.14 🔴 `%` by zero is NaN on real DOUBLE columns, where `/` is NULL
+
+*Phase 12 (integration suite), found on the seeded trip slice.* The reference returns
+NULL for `x % 0`. `divergence.md` line 60 records this as **"no rule needed ✅"**, and for
+the literal forms it was checked against that is true -- `5 % 0` and `5.0 % 0.0` fold to
+integer and DECIMAL, and both give NULL.
+
+Two real `DOUBLE` columns do not:
+
+```
+SELECT fare_amount % trip_distance FROM trips WHERE trip_distance = 0
+  ->  nan      (the reference gives NULL)
+```
+
+`/` is rewritten and `%` is not, so the two operators disagree with each other on
+identical inputs. NaN is a *value*: it passes `IS NOT NULL`, survives an aggregate and
+poisons a sum, so nothing downstream notices. 76 of the 5,000 seeded trips have a
+distance of exactly 0.0, which is how it surfaced.
+
+**The lesson is about the divergence table, not just the rule.** A row marked "no rule
+needed" was verified with literals, and literal arithmetic is folded before it ever
+reaches DuckDB's `DOUBLE` kernels. Every ✅ in that table established against literals is
+worth re-checking against a column.
+
+Pinned by `tests/integration/test_it_conformance.py::TestDivisionByZero`, alongside a
+control asserting `/` still gives NULL.
+
+### 1.15 🔴 `CAST(double AS INT)` rounds; the reference truncates
+
+*Phase 12 (integration suite), found in the same pass.* The reference truncates toward
+zero. This rounds to nearest:
+
+| expression | icetl | the reference |
+|---|---|---|
+| `CAST(3.94 AS INT)` | `4` | `3` |
+| `CAST(-3.94 AS INT)` | `-4` | `-3` |
+| `CAST(2.5 AS INT)` | `3` | `2` |
+
+Both surfaces agree with each other and disagree with the reference, so P1 holds -- the
+conformance rule is simply absent. `sql/conformance.py`'s `_fix_casts` only chooses
+between `Cast` and `TryCast`; it says nothing about how a non-integral value is reduced
+to an integer.
+
+Nothing raises, the result is a plausible integer, and it is wrong for every input whose
+fractional part is ≥ 0.5. `divergence.md` line 58 covers the *unparseable* cast
+(`CAST('abc' AS INT)` → NULL) and stops there, so the numeric case was never recorded
+either way.
+
+Pinned by
+`tests/integration/test_it_conformance.py::TestFailedCasts::test_casting_a_double_to_an_int_rounds_instead_of_truncating`.
+
 ---
 
 ## 2. Loud failures — bugs that could not mislead
@@ -453,6 +504,99 @@ because that message is the useful part. On Windows there was no message.
 `PYTHONIOENCODING=utf-8` as the way to see PyIceberg's own report. The real message
 cannot be recovered — PyIceberg was still assembling it — so saying what happened is
 what is available, and it beats a charmap complaint by a distance.
+
+### 2.11 🟠 `DROP COLUMN` on the highest field-id is refused by a REST catalog
+
+*Phase 12 (integration suite), found on the first real-catalog DDL run.* Iceberg's REST
+spec says a table's `last-column-id` may **never decrease**. PyIceberg 0.11.1 recomputes
+it from the surviving fields, so dropping the column that happens to hold the highest id
+sends a smaller value and the catalog rejects the commit:
+
+```
+ALTER TABLE t DROP COLUMN amount        -- amount is field-id 3 of 3
+  BadRequestError: IllegalArgumentException: Invalid last column ID: 2 < 3
+```
+
+Dropping any *other* column succeeds, because the maximum does not move. Reproducible
+with PyIceberg alone -- `table.update_schema().delete_column(...)`, no icetl involved --
+so nothing in `src/` is at fault.
+
+**Why it was invisible for a whole phase.** The local fixture catalog is a PyIceberg
+`SqlCatalog`, which performs no such validation, so `tests/fixture/test_ddl.py` drops
+columns happily. This is the first defect found by the integration suite, and it is
+exactly the shape that suite was built for: a failure that only a real catalog can
+produce.
+
+**Two things follow.** The refusal is upstream and is pinned as a characterisation test
+in `tests/integration/test_it_ddl.py`, so it fails when PyIceberg fixes it. But the error
+also reaches the caller as a raw `pyiceberg.exceptions.BadRequestError`, escaping the
+translation §2.8 established -- that half *is* fixable here, and is not yet done.
+
+### 2.12 🔴 `expireSnapshots` of more than one snapshot fails against a REST catalog
+
+*Phase 12 (integration suite), found on the first real-catalog maintenance run.* The
+Iceberg REST spec gives the `remove-snapshots` metadata update **exactly one**
+`snapshot-id`. PyIceberg 0.11.1's `expire_snapshots().by_ids([...])` packs every id into
+one update, so the server rejects it:
+
+```
+IllegalArgumentException: Invalid set of snapshot ids to remove.
+Expected one value but received: [3836577306796928364, 2369089962784259436, 966653944600891838]
+```
+
+Expiring **one at a time succeeds**, verified directly against PyIceberg's own API. So
+the operation is available; only the batching is wrong.
+
+**Graded red rather than orange, despite being loud.** It arrives as
+`CommitStateUnknownException` -- an HTTP 500, so the client genuinely cannot tell whether
+the commit landed. For a *destructive* operation that is the worst available failure
+shape: the caller is left not knowing which snapshots still exist, and the obvious
+response (retry) is exactly what a partially-applied expiry does not want.
+
+**icetl is the one holding the batch.** `io/maintenance.py` builds the doomed set and
+commits it in a single call:
+
+```python
+fresh.maintenance.expire_snapshots().by_ids(sorted(doomed)).commit()
+```
+
+Since single-id commits work, the fix is on this side: commit one id per call. That
+trades one commit for N and makes a partial expiry possible on failure, so it wants a
+deliberate decision about reporting rather than a silent loop -- which is why it is
+recorded here rather than patched in passing.
+
+**Reach.** `retainLast=N` on any table with more than one expirable snapshot, which is
+the ordinary case. `olderThan` hits it too whenever more than one snapshot is old enough.
+Only `snapshotIds=[one]` is safe today. The local `SqlCatalog` performs no such
+validation, so `tests/fixture/test_maintenance.py` passes throughout.
+
+Pinned by `tests/integration/test_it_maintenance.py::TestExpireSnapshots`.
+
+### 2.13 🟠 `size()` does not accept a map
+
+*Phase 12 (integration suite), found while covering the nested replica.* The reference's
+`size()` takes an array **or a map**. Both `F.size` and `F.cardinality` emit
+`ARRAY_LENGTH`, which DuckDB defines only for lists:
+
+```
+No function matches the given name and argument types 'array_length(MAP(VARCHAR, BIGINT))'
+```
+
+`map_size` is not exported either, so `size(map_keys(m))` is the only route today.
+
+**Why it survived Phase 6.** `tests/fixture/test_functions2.py` exercises `F.size` once,
+against an array literal. Nothing ever passed it a map -- the gap is in the *test*
+matrix, not in anything the local catalog could or could not do, which is why this one
+would have been findable offline and simply was not looked for. The integration sweep
+found it because it calls every name against a column of each shape.
+
+Loud rather than silent, and there is a working spelling, so it is orange. Pinned by
+`tests/integration/test_it_complex.py::TestMaps::test_size_does_not_accept_a_map`, which
+is parametrized over both names and fails when either starts working.
+
+Note this is a *different* defect from the `size(NULL)` row already in
+`divergence.md` (line 607), which is about the value returned rather than the type
+accepted. Both are conformance bugs in the same function.
 
 ---
 
@@ -722,6 +866,11 @@ since paid off:
 | # | Finding | Owner |
 |---|---|---|
 | §1.8 | `weekday` / `dayofweek` differ between the surfaces, silently | **Phase 15** |
+| §1.14 | `%` by zero is NaN on DOUBLE columns where `/` is NULL; divergence.md line 60 is wrong | a conformance rule to add |
+| §1.15 | `CAST(double AS INT)` rounds instead of truncating | a conformance rule to add |
+| §2.11 | `DROP COLUMN` on the highest field-id is refused by a REST catalog (upstream); its error also escapes the hierarchy | upstream + a translation to add |
+| §2.12 | `expireSnapshots` batches snapshot ids into one update; a REST catalog rejects it with a 500 of unknown commit state | **fixable here** -- commit one id per call |
+| §2.13 | `size()` / `cardinality()` reject a map, which the reference accepts | a function-library gap; `map_size` is unexported |
 | — | `size(NULL)` is `NULL` on both surfaces; the reference says `-1` | **Phase 15** |
 | §3.6 | A self-join with disjoint filters prunes less than it could | Phase 4 note 11 |
 | §3.7 | `sum(double)` varies in its last digits | documented, not fixed |

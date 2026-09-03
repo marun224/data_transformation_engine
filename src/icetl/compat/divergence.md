@@ -57,7 +57,9 @@ propagation on unusual inputs, empty input, overflow, and decimal promotion.
 |---|---|---|---|---|
 | `CAST('abc' AS INT)` | `NULL` (non-ANSI) | error | `TRY_CAST` by default; `spark.sql.ansi.enabled=true` opts into strict. An explicit `try_cast(...)` stays lenient in both modes | ✅ |
 | `1/0` | `NULL` | `inf` | guarded division. sqlglot's the reference parser already emits the `NULLIF`, so both surfaces agree with no rule of ours | ✅ |
-| `x % 0` | `NULL` | `NULL` | no rule needed | ✅ |
+| `x % 0` (integer, DECIMAL) | `NULL` | `NULL` | no rule needed | ✅ |
+| `x % 0` (**DOUBLE columns**) | `NULL` | **`NaN`** | ⚠️ **no rule, and one is needed** — see FINDINGS §1.14. `/` is rewritten and `%` is not, so two real `DOUBLE` columns give NaN where the reference gives NULL. The literal forms this row was first checked against fold to DECIMAL, which is why it read as settled | ❌ |
+| `CAST(3.94 AS INT)` | `3` (truncate toward zero) | `4` (round to nearest) | ⚠️ **no rule** — see FINDINGS §1.15. `_fix_casts` chooses between `Cast` and `TryCast` and says nothing about how a non-integral value is reduced | ❌ |
 | Integer overflow | wraps | error | not emulated — we error. `ansi_mode` does not change this; DuckDB cannot be asked to wrap | ⚠️ |
 | Decimal promotion | the reference's precision rules | DuckDB's, and division falls to `DOUBLE` | explicit cast per the reference's rules | 📋 **deferred to Phase 14** — see below |
 
@@ -118,6 +120,7 @@ semantics were the reason for the column. Addition and subtraction already agree
 | `weekday` | Monday = 0 | `dayofweek` is Sunday = 0 | `(dayofweek + 6) % 7`, a *different* shift from `dayofweek`'s | ✅ |
 | `next_day(d, day)` | strictly after `d` | — | `(target - dow + 7) % 7`, mapping a zero delta to 7 | ✅ |
 | `array_size(NULL)` | `NULL` | `len` gives `NULL` | no rule needed — but `size(NULL)` is `-1`, so the two are not aliases | ✅ |
+| `size(map)` | the element count | **rejected** — `size`/`cardinality` emit `ARRAY_LENGTH`, which DuckDB defines only for lists | ⚠️ see FINDINGS §2.13. `map_size` is unexported, so `size(map_keys(m))` is the only route | ❌ |
 | `get(arr, i)` | 0-indexed | 1-indexed | `+ 1`; `element_at` stays 1-indexed, as the reference has it both ways | ✅ |
 | `array_except` | de-duplicates | `list_filter` does not | wrap in `list_distinct` | ✅ |
 | `split_part` out of range | `""` | `NULL` | coalesce to `""` | ✅ |

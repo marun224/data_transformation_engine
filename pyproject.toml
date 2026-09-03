@@ -72,7 +72,15 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 markers = [
   "integration: requires the live REST catalog + MinIO (deselected by default)",
+  "slow: an integration test that scans at real scale; adds minutes, not seconds",
 ]
 # Integration tests are opt-in: `uv run pytest -m integration`.
+#
+# `slow` is a second axis on top of `integration`, never a marker on its own -- which is
+# why this line needs no change to keep deselecting everything that touches the network:
+#
+#   pytest                                  the local suite, offline
+#   pytest -m "integration and not slow"    the fast tier, target under 5 minutes
+#   pytest -m integration                   everything, including the 41M-row scans
 addopts = "-m 'not integration' --strict-markers"
 filterwarnings = ["error::DeprecationWarning:icetl.*"]

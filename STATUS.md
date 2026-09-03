@@ -7,8 +7,8 @@ See [PLAN.md](PLAN.md) for the design and the full phase list.
 
 ## Resuming — read this first
 
-**Paused:** 2026-09-02, at the end of Phase 11. Every phase PLAN.md scheduled is done;
-what remains is deferred by decision.
+**Paused:** 2026-09-03, after building the real-catalog integration suite. Every phase
+PLAN.md scheduled is done; what remains is deferred by decision.
 
 ### Where things stand
 
@@ -16,8 +16,8 @@ what remains is deferred by decision.
 |---|---|
 | Phases 0–11 | **done**, green |
 | Phases 12, 13, 14, 15 | **deferred by decision**, each with its own section in PLAN.md §4 |
-| ⚠️ Live gap | `weekday`/`dayofweek` are off by one through `Session.sql()` — **use `F.*` for date parts** until Phase 15 |
-| Tests | 1679 local, 11 integration |
+| ⚠️ Live gaps | `weekday`/`dayofweek` off by one through `Session.sql()` (§1.8); `%` by zero gives NaN on DOUBLE columns (§1.14); `CAST(double AS INT)` rounds instead of truncating (§1.15); `expireSnapshots` of >1 snapshot fails on REST (§2.12) |
+| Tests | 1679 local, **737 integration** (724 fast + 13 `slow`) |
 | Gate | `ruff check` · `ruff format --check` · `mypy` all clean |
 | Benchmarks | [BENCHMARKS.md](BENCHMARKS.md), tracked; re-run and commit the diff when the read path changes |
 | Docs | [GUIDE.md](GUIDE.md) and [notebooks/00_quickstart.ipynb](notebooks/00_quickstart.ipynb) |
@@ -118,12 +118,22 @@ PLAN.md §4 and its own reason:
 | **Phase 12** | merge-on-read **reads** | Decision 11. `exec/scan_planner.py` already refuses such a table rather than returning deleted rows — the day an upstream writer switches, queries start failing loudly and this is what unblocks them. **The most likely to become urgent without warning.** |
 | **Phase 13** | merge-on-read **writes** | Decision 11, further out. Needs 12 first. |
 | **Phase 14** | decimal promotion | Decision 14. `*` differs in precision and `/` returns `DOUBLE`. No guard is possible — detecting it costs the same as fixing it. |
-| **Phase 15** | SQL-surface function resolution | Decision 16, and the one **live wrong answer** in the codebase: `weekday`/`dayofweek` differ between surfaces, silently. |
+| **Phase 15** | SQL-surface function resolution | Decision 16. `weekday`/`dayofweek` differ between surfaces, silently (§1.8) — one of several live wrong answers now, see below. |
 
-**If picking one, Phase 15.** It is the only item on the list that is currently giving a
-wrong answer rather than refusing, it is bounded — a resolution hook plus an exhaustive
+**If picking one, Phase 15.** It is bounded — a resolution hook plus an exhaustive
 both-surfaces test — and P1 ("the two surfaces are one code path") does not actually
 hold until it is done.
+
+**But three things now rank above it**, all found by the integration suite on
+2026-09-03 and all currently giving a wrong answer rather than refusing:
+
+| | | |
+|---|---|---|
+| **§2.12** | `expireSnapshots` of more than one snapshot fails against a REST catalog, with an unknown commit state | **Fixable here in a few lines** — commit one id per call instead of batching. Destructive operation, worst failure shape; take this first |
+| **§1.15** | `CAST(double AS INT)` rounds where the reference truncates | A conformance rule. Wrong for most inputs, silently, on an extremely common operation |
+| **§1.14** | `%` by zero is NaN on `DOUBLE` columns where `/` is NULL | A conformance rule, and a prompt to re-check every ✅ in `divergence.md` that was established with literals |
+
+See "The integration suite" below for all five findings and how they were reached.
 
 Four things to carry into whatever comes next:
 
@@ -158,6 +168,101 @@ And Phase 11 a third:
 > **Run the documentation.** Every cell of the quickstart was executed rather than
 > written and hoped for, and that is what found FINDINGS §2.10 — a schema mismatch
 > reporting a codec error instead of itself, on every Windows console.
+
+---
+
+## The integration suite — real catalog, real data (2026-09-03)
+
+The 1679-test suite runs against a sqlite `SqlCatalog` over a temp directory. Only 11
+tests touched the real thing, and STATUS.md already recorded three defects that *only a
+real table could reach*. So the gap got a suite of its own: **737 tests against the live
+REST catalog and MinIO**, mirroring the whole functional surface.
+
+### What it is
+
+| | |
+|---|---|
+| `tests/integration/guard.py` | the namespace guard and the `Witness` |
+| `tests/integration/seed.py` | both seeding layers, idempotent |
+| `tests/integration/helpers.py` | shared `scan_of` plus the five differential techniques |
+| `tests/integration/conftest.py` | session, catalog, seeded tables, teardown |
+| 18 × `test_it_*.py` | one per functional area |
+
+```bash
+uv run pytest -m "integration and not slow"    # 724, ~2m50s
+uv run pytest -m integration                   # 737, ~3m10s
+uv run pytest -m integration --it-reseed       # rebuild the seed tables
+```
+
+### Two seeding layers, because one table cannot do both jobs
+
+**Replicas.** The same six fixtures `tests/fixtures/generator.py` builds, but built into
+`icetl_it` on the REST catalog. Their contents are known exactly, so tests assert `==
+30.25` rather than comparing two engines and hoping — while running over a real object
+store, real `s3://` translation and real parquet. They also supply the three shapes no
+real table here has: nested types, a rename history, and merge-on-read delete files.
+
+The only change needed was a `namespace=` parameter on the six builders. `build_mor` came
+along for free, and it is the valuable one — it hand-writes a `ManifestContent.DELETES`
+manifest, which is the only way to get a merge-on-read table at all.
+
+**Real data.** `icetl_it.trips` is a week of `nyc.yellow_tripdata` carved out by icetl's
+own write path: 880,374 rows, 106,682 real NULLs, 253 real pickup zones, partitioned by
+`VendorID`. `trips_small` is a 5,000-row template the write and row-level tests copy.
+`zones` is a join partner keyed on a column that really is in the data.
+
+### How you assert on data you did not author
+
+No expected value derived from `nyc` is ever written into a test. Five techniques, chosen
+per test: exact values on a replica we built; **differential against PyIceberg**, which
+owns the metadata; **differential across the two surfaces**, which is P1 and is exactly
+how the `count()`-vs-`collect()` bug hid for two phases; differential against raw DuckDB
+reading the same parquet; and **algebraic invariants** — the groups sum to the whole, a
+predicate and its complement re-union to the table, `row_number()` over n rows is 1..n.
+
+### Writing to a live catalog safely
+
+Three layers, and the third is the one that matters:
+
+1. `it_namespace()` refuses to resolve to `nyc` or `amazon`.
+2. `safe_drop()` refuses any table outside the suite's namespace; nothing calls
+   `catalog.drop_table` directly.
+3. **`Witness`** reads every protected table's snapshot id, row count and schema id
+   before the seeder runs and again after the last test, and fails the session if
+   anything moved.
+
+The first two prevent the mistakes anyone anticipates. The third notices the ones nobody
+did, and it does not depend on the suite being right about where it writes. After a full
+run `nyc` and `amazon` are byte-identical and `icetl_it` holds only the nine seed tables.
+
+### It found five defects on the first pass
+
+None was reachable offline, and three had been passing locally for phases.
+
+| | | |
+|---|---|---|
+| **§1.14** 🔴 | `%` by zero gives **NaN** on real `DOUBLE` columns where `/` gives NULL | `divergence.md` line 60 said "no rule needed ✅" — true of the literals it was checked with, which fold to DECIMAL. NaN is a *value*, so nothing downstream notices |
+| **§1.15** 🔴 | `CAST(double AS INT)` **rounds**; the reference truncates | `CAST(3.94 AS INT)` is 4 here and 3 there. Wrong for every input with a fractional part ≥ 0.5 |
+| **§2.12** 🔴 | `expireSnapshots` of more than one snapshot **fails against REST** | PyIceberg batches every id into one `remove-snapshots` update; the spec allows one. Comes back as `CommitStateUnknownException` — for a destructive operation, the worst failure shape. **Fixable here**: commit one id per call |
+| **§2.11** 🟠 | `DROP COLUMN` on the highest field-id is refused by REST | Upstream: PyIceberg lowers `last-column-id`, which the spec forbids. Any other column is fine |
+| **§2.13** 🟠 | `size()` / `cardinality()` reject a map | The reference accepts both; `map_size` is unexported. `size(map_keys(m))` works |
+
+Each is pinned by a **characterisation test** that asserts the current behaviour, so it
+fails when the defect is fixed. The lesson worth carrying:
+
+> **A divergence marked ✅ against literals has not been checked.** Literal arithmetic is
+> folded before it reaches DuckDB's `DOUBLE` kernels, so §1.14 looked settled for four
+> phases. Every ✅ in `divergence.md` established with `F.lit(...)` is worth re-running
+> against a column.
+
+### What is deliberately not mirrored
+
+All of `tests/unit/` (485 tests — pure-tree, no catalog), `test_fixture_tables.py`
+(meta-tests on the generator), and `test_engine_memory.py` (synthetic `range()`,
+catalog-free). The `F.*` library is covered by a **sweep of all 296 scalar names against
+a real column** plus targeted value tests, rather than by duplicating 240 literal-argument
+assertions that the catalog cannot influence — `test_every_exported_name_is_accounted_for`
+fails if a new name lands in no bucket.
 
 ---
 

@@ -2,6 +2,7 @@
 
 from tests.fixtures.generator import (
     FIXTURE_BUILDERS,
+    FixtureBuilder,
     FixtureTable,
     build_all,
     local_catalog,
@@ -10,6 +11,7 @@ from tests.fixtures.generator import (
 
 __all__ = [
     "FIXTURE_BUILDERS",
+    "FixtureBuilder",
     "FixtureTable",
     "build_all",
     "local_catalog",
