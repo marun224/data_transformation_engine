@@ -718,3 +718,88 @@ until this lands.
 2. You run: `uv venv --python 3.12 && uv sync --all-extras`.
 3. You run `uv run python scripts/smoke_catalog.py` and paste the output.
 4. Phase 1 begins.
+
+---
+
+## 9. Fix plan — FINDINGS §1.14, `%` by zero *(planned 2026-09-03, not started)*
+
+Chosen off STATUS.md's "three things now rank above Phase 15" list. Written up before
+implementing; nothing in `src/` or `tests/` has been touched yet.
+
+**Why this one of the three.** §2.12 needs a deliberate decision about how a partial
+expiry is reported before a line is written, and §1.15 needs the *source* type of a cast
+which the conformance pass does not have — a blanket `TRUNC` wrap breaks
+`CAST('abc' AS INT) -> NULL`. §1.14 needs neither: it is one rewrite rule in the module
+that already exists to hold rules of exactly this shape.
+
+### The defect
+
+The reference returns NULL for `x % 0`. `/` carries a `NULLIF` guard and `%` carries
+nothing, so on real `DOUBLE` columns `%` returns **NaN** — a value, not a NULL. It passes
+`IS NOT NULL`, survives an aggregate and poisons a sum, so nothing downstream notices.
+
+### What was established before planning
+
+Four probes, because the shape of the fix turns on each:
+
+| Question | Answer | What follows |
+|---|---|---|
+| Do both surfaces build the same node? | Yes — `Session.sql("a % b")` and `F.col("a") % F.col("b")` both give `exp.Mod` | One tree pass covers both *by construction*, which is §3.5's whole argument for this module |
+| Does `exp.Mod` take sqlglot's `safe` flag, as `exp.Div` does? | **No.** `Div.arg_types` has `typed`/`safe`; `Mod.arg_types` is `this`/`expression` only | The `NULLIF` must be built explicitly. The division trick does not transfer |
+| Is a *literal* zero divisor safe, as divergence.md line 60 claimed? | **No.** `5.0::DOUBLE % 0` -> `NaN` | The guard cannot skip literal zeros. Only a non-zero literal may skip |
+| Does the guard actually work on both type families? | Yes — `5.0::DOUBLE % NULLIF(0.0::DOUBLE, 0)` and `5 % NULLIF(0, 0)` both give NULL | `NULLIF` is the right instrument; no per-type branch needed |
+
+### The rule
+
+`_fix_modulo`, a third transform in `apply_compat_semantics`, wrapping the **divisor**:
+`x % y` -> `x % NULLIF(y, 0)`.
+
+Four decisions inside it:
+
+- **A definitely-non-zero literal divisor skips the guard**, exactly as `Column._division`
+  already does. `NULLIF(2, 0)` in every generated query makes `explain()` harder to read
+  and buys nothing.
+- **A literal zero divisor does *not* skip it** — see the third probe above. This is the
+  half divergence.md got wrong.
+- **Idempotent**: a divisor already spelled `NULLIF(_, 0)` is left alone, so a second pass
+  over a conformed tree, or a user who wrote the guard themselves, does not double-wrap.
+- **`conformance.py` stays a pure-sqlglot leaf.** Only `session.py` imports it today. The
+  four-line non-zero-literal check is defined locally rather than imported from
+  `column.py`, which would drag `plan.builder` and `icetl.types` into a leaf module to
+  save four lines.
+
+**`F.pmod` is fixed for free.** It builds `((a % b) + b) % b` out of two raw `Mod` nodes;
+the pass guards both, so `pmod(x, 0)` becomes NULL — which is what the reference gives.
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/icetl/sql/conformance.py` | `_fix_modulo` + the literal helper, wired into `apply_compat_semantics`; the module docstring's "deliberately not here" note currently implies `%` is fine |
+| `src/icetl/sql/column.py` | `__mod__`'s comment asserts *"DuckDB already returns NULL for `x % 0`. No guard needed."* — the disproved claim. Replaced with a pointer to the rule |
+| `tests/unit/test_conformance.py` | `test_modulo_by_zero_needs_no_guard` moves out of `TestAlreadyMatching`, where it no longer belongs, into a new `TestModulo`: guard emitted, non-zero literal untouched, no double-wrap, both of `pmod`'s nodes guarded |
+| `tests/fixture/test_conformance.py` | A `TestModulo` mirroring `TestDivision` — both surfaces, a runtime zero via `id - 3`, ordinary modulo unharmed |
+| `tests/integration/test_it_conformance.py` | Flip the pinned characterisation test, per the instruction in its own failure message: every remainder becomes NULL. The `/` control stays |
+| `src/icetl/compat/divergence.md` | Lines 60–61 collapse into one ✅ row naming the rule |
+| `FINDINGS.md` | §1.14 records the guard, as §1.1–§1.13 do |
+| `STATUS.md` | §1.14 leaves the "Live gaps" row and the ranked list above |
+
+### Verification
+
+`uv run tox` — lint, format, mypy, 1679 tests — then `uv run pytest -m integration`.
+The integration run is not optional here: §1.14's pinned test is an integration test, and
+the defect only appears on two real `DOUBLE` columns, so a local-only pass proves nothing
+about the thing being fixed. Needs the REST catalog on `:8182` and MinIO on `:9100`.
+
+### The risk to watch
+
+Conformance runs **before** the optimizer and pushdown (`session.py`, and deliberately so
+per §3.5), so a `NULLIF` introduced into a `WHERE` predicate now flows through both. That
+is why the whole gate clears this rather than the conformance tests alone.
+
+### The wider prompt
+
+FINDINGS §1.14's real lesson is about the divergence table, not the rule: this row was
+marked ✅ on the strength of *literal* arithmetic, and literals are folded before they
+reach DuckDB's `DOUBLE` kernels. **Every ✅ in `divergence.md` established with literals
+is worth re-checking against a column.** That sweep is not part of this fix.

@@ -12,14 +12,14 @@ df.show()
 ```
 
 **sqlglot** is the single IR, **PyIceberg** plans and commits, **DuckDB** executes.
-See [PLAN.md](PLAN.md) for the full design, phases, and the decisions behind them.
+See [PLAN.md](https://github.com/marun224/data_transformation_engine/blob/main/PLAN.md) for the full design, phases, and the decisions behind them.
 
 Where DuckDB's behaviour is a defensible choice rather than the only one, icetl follows
 **Apache Spark 3.5** as a written specification — `1/0` is NULL, a failed cast is NULL,
 `ORDER BY` puts nulls first ascending. That is a spec reference, not a dependency:
 nothing here runs on, links against, or requires Spark. Every place the two engines
-disagree is recorded in [divergence.md](src/icetl/compat/divergence.md), and every place a
-dependency turned out to be wrong is in [FINDINGS.md](FINDINGS.md).
+disagree is recorded in [divergence.md](https://github.com/marun224/data_transformation_engine/blob/main/src/icetl/compat/divergence.md), and every place a
+dependency turned out to be wrong is in [FINDINGS.md](https://github.com/marun224/data_transformation_engine/blob/main/FINDINGS.md).
 
 ## Status
 
@@ -33,10 +33,10 @@ dynamic partition overwrite — row-level `DELETE`, `UPDATE` and `MERGE` with th
 merge grammar, `session.catalog.*`, SQL DDL with partition and sort-order evolution,
 `mergeSchema`, time travel (`VERSION AS OF` / `TIMESTAMP AS OF`) and Iceberg's metadata
 tables, Python UDFs, single-node table maintenance, and convenience readers for
-parquet/CSV/JSON. What remains is deferred by decision — see [STATUS.md](STATUS.md).
+parquet/CSV/JSON. What remains is deferred by decision — see [STATUS.md](https://github.com/marun224/data_transformation_engine/blob/main/STATUS.md).
 
-**Start here:** [GUIDE.md](GUIDE.md), or run
-[notebooks/00_quickstart.ipynb](notebooks/00_quickstart.ipynb), which builds its own
+**Start here:** [GUIDE.md](https://github.com/marun224/data_transformation_engine/blob/main/GUIDE.md), or run
+[notebooks/00_quickstart.ipynb](https://github.com/marun224/data_transformation_engine/blob/main/notebooks/00_quickstart.ipynb), which builds its own
 warehouse and needs no catalog.
 
 ### On a wide table, ask for Arrow
@@ -50,7 +50,7 @@ for batch in df.toArrowBatches():  # peak memory is one batch
     ...
 ```
 
-Numbers, and how to read a regression, in [BENCHMARKS.md](BENCHMARKS.md).
+Numbers, and how to read a regression, in [BENCHMARKS.md](https://github.com/marun224/data_transformation_engine/blob/main/BENCHMARKS.md).
 
 ## Setup
 
@@ -83,7 +83,7 @@ uv run tox -- -k pushdown        # arguments after `--` go to pytest
 
 Performance is tracked rather than assumed. `scripts/benchmark.py` times nine queries
 over a generated 200-column table, checking each one's answer on every repeat; commit
-the diff to [BENCHMARKS.md](BENCHMARKS.md) when you change anything on the read path:
+the diff to [BENCHMARKS.md](https://github.com/marun224/data_transformation_engine/blob/main/BENCHMARKS.md) when you change anything on the read path:
 
 ```bash
 uv run python scripts/benchmark.py                          # the default suite
@@ -124,5 +124,5 @@ snapshot id before and after the run and fails if either moved.
 Both tiers assert the same behaviours. What differs is everything underneath — a REST
 catalog rather than sqlite, MinIO rather than a temp directory, `s3://` paths, real
 NULLs, real cardinality, 62-file scans. That is where the defects have been: five of
-them are recorded in [FINDINGS.md](FINDINGS.md) §1.14, §1.15, §2.11, §2.12 and §2.13,
+them are recorded in [FINDINGS.md](https://github.com/marun224/data_transformation_engine/blob/main/FINDINGS.md) §1.14, §1.15, §2.11, §2.12 and §2.13,
 and none was reachable offline.

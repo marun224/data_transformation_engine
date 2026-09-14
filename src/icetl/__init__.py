@@ -7,6 +7,6 @@ See PLAN.md for the architecture. The short version:
     DuckDB     executes                 (parquet over httpfs, Arrow out)
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 __all__ = ["__version__"]
